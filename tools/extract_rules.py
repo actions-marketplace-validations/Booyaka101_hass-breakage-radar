@@ -39,7 +39,7 @@ import re
 import sys
 import tarfile
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Collection, Iterable, Iterator
 
 if __package__ in (None, ""):  # allow `python tools/extract_rules.py`
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -57,6 +57,8 @@ from tools.release import resolve_latest_release  # noqa: E402
 from tools.rules_engine import (  # noqa: E402
     VERSION_RE,
     Rule,
+    base_names,
+    decorated_as_property,
     is_future,
     is_pending,
     normalise_version,
@@ -100,9 +102,13 @@ DEPRECATED_CONSTANT_CALLS = frozenset(
 
 _DEPRECATED_PREFIX = "_DEPRECATED_"
 
-#: Minimum length for an auto-derived symbol to be trusted as a matcher.
+#: Minimum length for a *bare* auto-derived symbol to be trusted as a matcher.
 #: Short names like ``async_listen`` collide with everybody's own helpers.
 #: See LESSONS 2026-07-27: a rule written from a spec is a hypothesis.
+#: Bare means neither pinned to the core module that defines it (the import
+#: graph then proves every match) nor scoped to the entity base class it is
+#: deprecated on (see :func:`marker_scope`). Since call matchers gained their
+#: module pin, that leaves a deprecated class name.
 MIN_AUTO_SYMBOL_LEN = 18
 
 #: Names that clear the length gate but are still too common to match on.
@@ -114,6 +120,16 @@ AUTO_SYMBOL_DENYLIST = frozenset(
         "async_write_ha_state",
     }
 )
+
+#: English the prose regexes lift where a keyword name should be. Core writes
+#: "calls `async_get_or_create` with a `via_device` referencing the device
+#: itself", and the regex reads the article as the keyword.
+KWARG_STOPWORDS = frozenset(
+    {"a", "an", "the", "one", "both", "either", "any", "its", "this", "some", "no"}
+)
+
+#: Below this, a candidate keyword has to be proved by core's own signatures.
+MIN_AUTO_KWARG_LEN = 4
 
 # `calls foo`, ``calls `foo` ``, `calls module.foo,`
 _RE_CALLS = re.compile(r"\bcalls\s+`?([A-Za-z_][\w.]*)`?")
@@ -136,8 +152,60 @@ def _tail(dotted: str) -> str:
     return dotted.rsplit(".", 1)[-1]
 
 
-def _trusted(symbol: str) -> bool:
-    return len(symbol) >= MIN_AUTO_SYMBOL_LEN and symbol not in AUTO_SYMBOL_DENYLIST
+def _trusted(
+    symbol: str,
+    discarded: list[tuple[str, str]] | None = None,
+    *,
+    pinned: bool = False,
+) -> bool:
+    """Whether a symbol is distinctive enough to match on.
+
+    A ``pinned`` symbol is matched only where the import graph proves the call
+    reaches the core module that defines it (``_module_allowed`` in the
+    engine), so the length gate adds nothing there and only the denylist
+    applies. ``discarded`` collects ``(symbol, reason)`` for every rejection,
+    so the gap the gate leaves is a published number rather than a silent one.
+    A name the prose regexes lifted out of a sentence -- ``calls the
+    deprecated helper`` yields ``the`` -- is not the gate doing its job and is
+    not counted as it.
+    """
+    if "_" not in symbol and symbol.islower():
+        return False
+    if symbol in AUTO_SYMBOL_DENYLIST:
+        reason = "denylisted"
+    elif not pinned and len(symbol) < MIN_AUTO_SYMBOL_LEN:
+        reason = "too_short"
+    else:
+        return True
+    if discarded is not None:
+        discarded.append((symbol, reason))
+    return False
+
+
+def _plausible_kwarg(
+    kwarg: str,
+    params: Collection[str],
+    discarded: list[tuple[str, str]] | None = None,
+) -> bool:
+    """Whether a keyword lifted out of a sentence is really a keyword.
+
+    ``_RE_CALL_WITH`` reads "calls X with Y" and takes Y on trust, so an
+    English word in that slot became a matcher that could never fire: 1.11.0
+    shipped ``async_get_or_create(a=...)`` and ``async_update_device(one=...)``,
+    both matchable, both dead. A real keyword is either long enough and
+    underscored to be recognisable as one, or named verbatim in the signature
+    of something in the same core file -- which is what settles ``hass`` and
+    ``entity`` without letting ``the`` through.
+    """
+    if kwarg in KWARG_STOPWORDS:
+        reason = "not_a_keyword"
+    elif (len(kwarg) < MIN_AUTO_KWARG_LEN or "_" not in kwarg) and kwarg not in params:
+        reason = "implausible_keyword"
+    else:
+        return True
+    if discarded is not None:
+        discarded.append((kwarg, reason))
+    return False
 
 
 def _message_for(callee: str, symbol: str, release: str) -> str:
@@ -151,6 +219,143 @@ def _message_for(callee: str, symbol: str, release: str) -> str:
     if callee == "deprecated_class":
         return f"uses `{symbol}`, which is deprecated and removed in Home Assistant {release}."
     return f"uses `{symbol}`, deprecated and removed in Home Assistant {release}."
+
+
+def _logs_it_as(lead: str, what: str) -> str:
+    """Our own sentence, then core's, which is what the log line will say."""
+    return f"{lead} Home Assistant logs it as: {what}" if what else lead
+
+
+def _missing_option_message(matcher: dict[str, Any], release: str, what: str) -> str:
+    """The message for a missing key or keyword, said in the right terms.
+
+    Core's prose calls both of these a keyword and misnames one of the
+    functions, so the sentence is generated from the guard instead. See
+    :func:`marker_guard`.
+    """
+    target = matcher["names"][0]
+    if matcher["type"] == "call_missing_arg_key":
+        lead = (
+            f"doesn't set `{matcher['key']}` in the `{matcher['arg']}` passed to "
+            f"`{target}`, which is required from Home Assistant {release}."
+        )
+    else:
+        needed = "` and `".join(matcher.get("requires", ()))
+        lead = (
+            f"calls `{target}`{f' with `{needed}`' if needed else ''} but no "
+            f"`{matcher['kwarg']}`, which is required from Home Assistant "
+            f"{release}."
+        )
+    return _logs_it_as(lead, what)
+
+
+def _scoped_message(symbol: str, release: str, what: str) -> str:
+    """The message for a scoped rule, naming the base class as well.
+
+    ``battery_level`` on its own identifies nothing: half the ecosystem has
+    one. It is a deprecation only together with the class it is deprecated on,
+    so the finding has to say both.
+    """
+    base, _, name = symbol.partition(".")
+    lead = (
+        f"defines `{name}` on a subclass of `{base}`, which is deprecated and "
+        f"removed in Home Assistant {release}."
+    )
+    return _logs_it_as(lead, what)
+
+
+def _annotation_name(annotation: ast.expr | None) -> str:
+    """The bare name of a simple annotation: ``StatisticMetaData``."""
+    if isinstance(annotation, ast.Name):
+        return annotation.id
+    if isinstance(annotation, ast.Attribute):
+        return annotation.attr
+    return ""
+
+
+def _undefined_test(condition: ast.expr, op: type[ast.cmpop]) -> str:
+    """The name in ``x is UNDEFINED`` / ``x is not UNDEFINED``, for that ``op``."""
+    if not (isinstance(condition, ast.Compare) and len(condition.ops) == 1):
+        return ""
+    if not isinstance(condition.ops[0], op):
+        return ""
+    left, right = condition.left, condition.comparators[0]
+    if isinstance(left, ast.Name) and _annotation_name(right) == "UNDEFINED":
+        return left.id
+    return ""
+
+
+def marker_guard(
+    guards: list[ast.expr],
+    func: ast.FunctionDef | ast.AsyncFunctionDef | None,
+) -> dict[str, Any] | None:
+    """What the ``if`` around a "doesn't specify X" marker actually tests.
+
+    The prose says "keyword" even where core means a key of a mapping
+    argument. ``async_import_statistics`` takes its options inside
+    ``metadata``, so ``unit_class=`` is not a keyword it accepts at all, and a
+    keyword matcher for it fired on every caller. The guard tells the two
+    apart:
+
+    ``"unit_class" not in metadata``   a key of that parameter
+    ``new_unit_class is UNDEFINED``    a real keyword, and an ``x is not
+                                       UNDEFINED`` term next to it is a
+                                       precondition for the check being armed
+
+    The enclosing function is the one third-party code calls, and it is more
+    reliable than the prose: core's ``mean_type`` marker inside
+    ``async_add_external_statistics`` names ``async_import_statistics``.
+    """
+    if func is None:
+        return None
+    positional = [*func.args.posonlyargs, *func.args.args]
+    params = {arg.arg: arg for arg in [*positional, *func.args.kwonlyargs]}
+
+    for condition in guards:
+        if not (isinstance(condition, ast.Compare) and len(condition.ops) == 1):
+            continue
+        key, right = condition.left, condition.comparators[0]
+        if not (
+            isinstance(condition.ops[0], ast.NotIn)
+            and isinstance(key, ast.Constant)
+            and isinstance(key.value, str)
+            and isinstance(right, ast.Name)
+            and right.id in params
+        ):
+            continue
+        guard = {
+            "kind": "arg_key",
+            "key": key.value,
+            "arg": right.id,
+            "target": func.name,
+            "constructor": _annotation_name(params[right.id].annotation),
+        }
+        index = next(
+            (i for i, arg in enumerate(positional) if arg.arg == right.id), None
+        )
+        if index is not None:
+            guard["arg_index"] = index
+        return guard
+
+    missing = [
+        name
+        for condition in guards
+        if (name := _undefined_test(condition, ast.Is)) in params
+    ]
+    if not missing:
+        return None
+    return {
+        "kind": "kwarg",
+        "kwarg": missing[0],
+        "requires": sorted(
+            {
+                name
+                for condition in guards
+                if (name := _undefined_test(condition, ast.IsNot)) in params
+            }
+        ),
+        "target": func.name,
+    }
 
 
 def _call_matcher(symbol: str, module: str) -> dict[str, Any]:
@@ -193,6 +398,78 @@ def _enclosing_name(chain: list[str]) -> str:
     return ".".join(chain)
 
 
+def _is_entity_class(name: str, bases: Iterable[str]) -> bool:
+    """Whether a core class is one integrations are meant to subclass.
+
+    Home Assistant names every entity base class ``<Domain>Entity``, and
+    measuring the 26 classes on dev that carry a marker, the name agrees with
+    real inheritance on 23. It is the better test on the other three:
+    ``BluesoundPlayer`` and ``HueLight`` do derive from an entity class, but
+    they are core's own integrations, so a rule scoped to either could never
+    match anything. The distinction matters because an ``attr`` matcher fires
+    on a *subclass* defining the name, which is the breakage for
+    ``StateVacuumEntity`` and noise for ``ConfigFlow``, ``DeviceRegistry`` or
+    ``TemperatureConverter``. A private class is core-internal by declaration.
+    """
+    if name.startswith("_"):
+        return False
+    return name.endswith("Entity") or any(base.endswith("Entity") for base in bases)
+
+
+def _reported_symbols(node: ast.ClassDef, method: str) -> list[str]:
+    """Attribute names a private reporter method is called with in its class.
+
+    Core's vacuum battery deprecation names nothing at the marker itself: the
+    warning lives in ``_report_deprecated_battery_properties(property)`` and
+    the attributes reach it as string literals from ``__init_subclass__``.
+    """
+    found: list[str] = []
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call) or not child.args:
+            continue
+        func = child.func
+        if not isinstance(func, ast.Attribute) or func.attr != method:
+            continue
+        literal = _literal(child.args[0])
+        if literal and literal not in found:
+            found.append(literal)
+    return found
+
+
+def marker_scope(
+    chain: list[ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef],
+) -> dict[str, Any] | None:
+    """The entity base class a marker sits in, and the attributes it names.
+
+    ``chain`` is the marker's enclosing definitions, outermost first. Returns
+    ``None`` unless the marker sits on a property, or on a private reporter
+    called with attribute names, inside a Home Assistant entity base class --
+    the only shape where "a subclass defines this name" is the breakage.
+    """
+    index = max(
+        (i for i, node in enumerate(chain) if isinstance(node, ast.ClassDef)),
+        default=-1,
+    )
+    if index < 0:
+        return None
+    node = chain[index]
+    if not _is_entity_class(node.name, base_names(node)):
+        return None
+    method = chain[index + 1] if index + 1 < len(chain) else None
+    if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return None
+    if decorated_as_property(method):
+        symbols = [method.name]
+    elif method.name.startswith("_"):
+        symbols = _reported_symbols(node, method.name)
+    else:
+        symbols = []
+    symbols = [s for s in symbols if s.isidentifier() and not s.startswith("_")]
+    if not symbols:
+        return None
+    return {"base": node.name, "symbols": symbols}
+
+
 def module_of(path: str) -> str:
     """``homeassistant/helpers/entity_registry.py`` -> the importable module."""
     stem = path[:-3] if path.endswith(".py") else path
@@ -202,7 +479,14 @@ def module_of(path: str) -> str:
 
 
 def derive_matcher(
-    callee: str, what: str, enclosing: str, path: str = ""
+    callee: str,
+    what: str,
+    enclosing: str,
+    path: str = "",
+    scope: dict[str, Any] | None = None,
+    discarded: list[tuple[str, str]] | None = None,
+    params: Collection[str] = (),
+    guard: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Turn a human-readable deprecation message into a machine matcher.
 
@@ -214,28 +498,49 @@ def derive_matcher(
     ``entity_registry.async_generate_entity_id`` fires on every call to the
     entirely healthy ``entity.async_generate_entity_id``, which is a real false
     positive measured on 0xAlon/dolphin during the first crawl slice.
-    """
-    module = module_of(path) if path else ""
-    if callee == "deprecated_hass_argument":
-        # Only the leading `hass` argument is deprecated, not the function.
-        symbol = _tail(enclosing)
-        if symbol and _trusted(symbol):
-            matcher = _call_matcher(symbol, module)
-            matcher["type"] = "call_hass_argument"
-            return matcher
-        return None
 
-    if callee == "deprecated_function":
+    ``scope`` is one ``{"base", "symbol"}`` pair from :func:`marker_scope`. It
+    pins the symbol to the entity base class it is deprecated on, which is what
+    makes a 13-character name like ``battery_level`` safe to match: the class a
+    finding names is core's, not one the author happens to share a word with.
+    Scoped symbols skip :data:`MIN_AUTO_SYMBOL_LEN` for that reason; bare ones
+    never do.
+
+    ``params`` is every parameter name declared in the core file the marker
+    came from. It is what :func:`_plausible_kwarg` checks a short keyword
+    against.
+
+    ``guard`` is :func:`marker_guard` on the ``if`` the marker sits under. A
+    "doesn't specify X" marker is derived from that rather than from its own
+    prose, which does not distinguish a keyword from a mapping key.
+    """
+    if scope:
+        return {
+            "type": "attr",
+            "names": [scope["symbol"]],
+            "in_class_base": [scope["base"]],
+        }
+
+    module = module_of(path) if path else ""
+    if callee in ("deprecated_hass_argument", "deprecated_function"):
         # The *decorated* function is the deprecated one; the argument is the
-        # replacement. `enclosing` is e.g. "FlowHandler.show_advanced_options".
-        symbol = _tail(enclosing)
-        if symbol and _trusted(symbol):
-            return _call_matcher(symbol, module)
+        # replacement. `enclosing` is e.g. "FlowHandler.show_advanced_options",
+        # and a method is pinned to its class so that
+        # ``TemperatureConverter.convert_interval(...)`` resolves to it.
+        owner, _, symbol = enclosing.rpartition(".")
+        if module and owner:
+            module = f"{module}.{owner}"
+        if symbol and _trusted(symbol, discarded, pinned=bool(module)):
+            matcher = _call_matcher(symbol, module)
+            if callee == "deprecated_hass_argument":
+                # Only the leading `hass` argument is deprecated, not the function.
+                matcher["type"] = "call_hass_argument"
+            return matcher
         return None
 
     if callee == "deprecated_class":
         symbol = _tail(enclosing)
-        if symbol and _trusted(symbol):
+        if symbol and _trusted(symbol, discarded):
             # A deprecated class shows up in third-party code either as a base
             # class or as a constructor call.
             return {"type": "classbase", "bases": [symbol]}
@@ -246,18 +551,39 @@ def derive_matcher(
 
     match = _RE_MISSING_KWARG.search(what)
     if match:
-        kwarg, target = match.group(1), _tail(match.group(2))
-        if _trusted(target):
-            matcher = _call_matcher(target, module)
-            matcher["type"] = "call_missing_kwarg"
-            matcher["kwarg"] = kwarg
+        if guard is None:
+            # Without the guard there is no telling a keyword from a mapping
+            # key, and guessing keyword was the whole false positive.
+            if discarded is not None:
+                discarded.append((_tail(match.group(2)), "unreadable_guard"))
+            return None
+        target = guard["target"]
+        if not _trusted(target, discarded, pinned=bool(module)):
+            return None
+        matcher = _call_matcher(target, module)
+        if guard["kind"] == "arg_key":
+            matcher["type"] = "call_missing_arg_key"
+            matcher["key"] = guard["key"]
+            matcher["arg"] = guard["arg"]
+            if "arg_index" in guard:
+                matcher["arg_index"] = guard["arg_index"]
+            if guard["constructor"]:
+                matcher["constructors"] = [guard["constructor"]]
             return matcher
-        return None
+        if not _plausible_kwarg(guard["kwarg"], params, discarded):
+            return None
+        matcher["type"] = "call_missing_kwarg"
+        matcher["kwarg"] = guard["kwarg"]
+        if guard["requires"]:
+            matcher["requires"] = guard["requires"]
+        return matcher
 
     match = _RE_CALL_WITH.search(what)
     if match:
         target, kwarg = _tail(match.group(1)), match.group(2)
-        if _trusted(target):
+        if _trusted(target, discarded, pinned=bool(module)) and _plausible_kwarg(
+            kwarg, params, discarded
+        ):
             matcher = _call_matcher(target, module)
             matcher["type"] = "call_kwarg"
             matcher["kwargs"] = [kwarg]
@@ -267,7 +593,7 @@ def derive_matcher(
     match = _RE_CALLS.search(what)
     if match:
         target = _tail(match.group(1))
-        if _trusted(target):
+        if _trusted(target, discarded, pinned=bool(module)):
             return _call_matcher(target, module)
         return None
 
@@ -284,6 +610,7 @@ def _kind_for(callee: str, matcher: dict[str, Any] | None) -> str:
         "call": "call",
         "call_kwarg": "call",
         "call_missing_kwarg": "call",
+        "call_missing_arg_key": "call",
         "call_hass_argument": "call",
         "attr": "attr",
         "attr_access": "attr",
@@ -292,6 +619,8 @@ def _kind_for(callee: str, matcher: dict[str, Any] | None) -> str:
 
 
 def _symbol_for(callee: str, what: str, enclosing: str, matcher) -> str:
+    if matcher and matcher.get("in_class_base"):
+        return f"{matcher['in_class_base'][0]}.{matcher['names'][0]}"
     if callee in ("deprecated_function", "deprecated_class", "deprecated_hass_argument"):
         return enclosing or what
     if matcher:
@@ -305,6 +634,8 @@ def _symbol_for(callee: str, what: str, enclosing: str, matcher) -> str:
                 return f"{base}({kwargs[0]}=...)"
             if matcher["type"] == "call_missing_kwarg" and kwargs:
                 return f"{base}(missing {kwargs[0]})"
+            if matcher["type"] == "call_missing_arg_key":
+                return f"{base}({matcher['arg']} without {matcher['key']})"
             if matcher["type"] == "call_hass_argument":
                 return f"{base}(hass, ...)"
             return base
@@ -345,6 +676,20 @@ def core_version(tarball: Path) -> str:
                 return f"{major.group(1)}.{minor.group(1)}"
             break
     raise RuntimeError("could not determine core version from homeassistant/const.py")
+
+
+def _parameter_names(tree: ast.Module) -> set[str]:
+    """Every parameter name declared anywhere in one core file."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            args = node.args
+            names.update(
+                arg.arg
+                for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs]
+            )
+            names.update(arg.arg for arg in (args.vararg, args.kwarg) if arg)
+    return names
 
 
 def _parent_map(tree: ast.Module) -> dict[ast.AST, ast.AST]:
@@ -388,6 +733,7 @@ def extract_from_source(
         return
 
     parents = _parent_map(tree)
+    params = _parameter_names(tree)
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -403,22 +749,50 @@ def extract_from_source(
         if not version:
             continue
 
-        chain: list[str] = []
+        chain: list[ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef] = []
+        guards: list[ast.expr] = []
+        child: ast.AST = node
         current: ast.AST | None = parents.get(node)
         while current is not None:
             if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                chain.append(current.name)
-            current = parents.get(current)
+                chain.append(current)
+            elif isinstance(current, ast.If) and child in current.body:
+                # Only the taken branch: an ``else`` says the opposite.
+                guards.extend(
+                    current.test.values
+                    if isinstance(current.test, ast.BoolOp)
+                    and isinstance(current.test.op, ast.And)
+                    else [current.test]
+                )
+            child, current = current, parents.get(current)
         chain.reverse()
+        enclosing_func = next(
+            (
+                frame
+                for frame in reversed(chain)
+                if isinstance(frame, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ),
+            None,
+        )
 
-        yield {
+        record = {
             "callee": callee,
             "version": version,
             "what": _what_text(node),
-            "enclosing": _enclosing_name(chain),
+            "enclosing": _enclosing_name([n.name for n in chain]),
             "path": path,
             "line": node.lineno,
+            "params": params,
+            "guard": marker_guard(guards, enclosing_func),
         }
+        scope = marker_scope(chain)
+        if scope is None:
+            yield record
+            continue
+        # One marker can deprecate several attributes at once, and each is its
+        # own rule so a finding names the attribute the author actually wrote.
+        for symbol in scope["symbols"]:
+            yield {**record, "scope": {"base": scope["base"], "symbol": symbol}}
 
 
 def extract_deprecated_constants(
@@ -508,8 +882,34 @@ def _import_rule(record: dict[str, Any], release: str) -> dict[str, Any]:
     }
 
 
-def build_rules(records: list[dict[str, Any]], pending_floor: str) -> list[dict[str, Any]]:
-    """Collapse raw call sites into deduplicated, published rules."""
+def _rule_message(
+    imported: dict[str, Any] | None,
+    matcher: dict[str, Any] | None,
+    callee: str,
+    symbol: str,
+    what: str,
+    release: str,
+) -> str:
+    if imported:
+        return imported["message"]
+    if matcher and matcher.get("in_class_base"):
+        return _scoped_message(symbol, release, what)
+    if matcher and matcher["type"] in ("call_missing_arg_key", "call_missing_kwarg"):
+        return _missing_option_message(matcher, release, what)
+    return what or _message_for(callee, symbol, release)
+
+
+def build_rules(
+    records: list[dict[str, Any]],
+    pending_floor: str,
+    discarded: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Collapse raw call sites into deduplicated, published rules.
+
+    ``discarded`` collects every marker left unmatchable by the length gate,
+    the denylist or the keyword-plausibility gate, so the size of that gap can
+    be published next to the rules.
+    """
     by_id: dict[str, dict[str, Any]] = {}
 
     for record in sorted(records, key=lambda r: (r["path"], r["line"])):
@@ -528,13 +928,31 @@ def build_rules(records: list[dict[str, Any]], pending_floor: str) -> list[dict[
             kind = "import"
             rule_id = imported["id"]
         else:
+            rejected: list[tuple[str, str]] = []
             matcher = (
                 derive_matcher(
-                    callee, record["what"], record["enclosing"], record["path"]
+                    callee,
+                    record["what"],
+                    record["enclosing"],
+                    record["path"],
+                    record.get("scope"),
+                    rejected,
+                    record.get("params", ()),
+                    record.get("guard"),
                 )
                 if callee in API_DEPRECATION_CALLS
                 else None
             )
+            if matcher is None and discarded is not None:
+                discarded.extend(
+                    {
+                        "symbol": name,
+                        "reason": reason,
+                        "breaks_in": release,
+                        "source": f"{record['path']}:{record['line']}",
+                    }
+                    for name, reason in rejected
+                )
             symbol = _symbol_for(callee, record["what"], record["enclosing"], matcher)
             kind = _kind_for(callee, matcher)
             if callee in ISSUE_CALLS:
@@ -557,11 +975,7 @@ def build_rules(records: list[dict[str, Any]], pending_floor: str) -> list[dict[
             id=rule_id,
             kind=kind,
             symbol=symbol,
-            message=(
-                imported["message"]
-                if imported
-                else record["what"] or _message_for(callee, symbol, release)
-            ),
+            message=_rule_message(imported, matcher, callee, symbol, record["what"], release),
             breaks_in=release,
             source=f"homeassistant/{record['path'].split('homeassistant/', 1)[-1]}:{record['line']}"
             if record["path"].startswith("homeassistant/")
@@ -676,7 +1090,10 @@ def main(argv: list[str] | None = None) -> int:
             sys.version_info.minor,
         )
 
-    rules = build_rules(records, latest.floor)
+    discarded: list[dict[str, Any]] = []
+    rules = build_rules(records, latest.floor, discarded)
+    discarded.sort(key=lambda d: (d["breaks_in"], d["symbol"], d["source"]))
+    pending_discarded = [d for d in discarded if is_pending(d["breaks_in"], latest.floor)]
     future = [r for r in rules if not r["expired"]]
     matchable = [r for r in future if r["matchable"]]
 
@@ -698,19 +1115,37 @@ def main(argv: list[str] | None = None) -> int:
             "matchable_future": len(matchable),
             "core_files_scanned": files,
             "core_files_unparsed": len(unparsed),
+            # The gates' cost, stated instead of assumed: markers core does
+            # announce that we refuse to match, because the bare name is too
+            # common or because the keyword the prose regex lifted is not a
+            # keyword. Scoping one to its entity base class takes it off here.
+            "markers_discarded": len(discarded),
+            "markers_discarded_pending": len(pending_discarded),
         },
         "unparsed_core_files": unparsed,
+        "discarded_markers": discarded,
         "rules": rules,
     }
     write_json(args.output, payload)
 
     LOGGER.info(
-        "wrote %s: %d rules (%d future, %d matchable)",
+        "wrote %s: %d rules (%d future, %d matchable); %d marker(s) discarded "
+        "by the symbol gate, %d of them still pending",
         args.output,
         len(rules),
         len(future),
         len(matchable),
+        len(discarded),
+        len(pending_discarded),
     )
+    for entry in pending_discarded:
+        LOGGER.info(
+            "  discarded %-10s %-40s %s (%s)",
+            entry["breaks_in"],
+            entry["symbol"],
+            entry["source"],
+            entry["reason"],
+        )
     for rule in matchable:
         LOGGER.info("  %-10s %-58s %s", rule["breaks_in"], rule["symbol"], rule["id"])
 

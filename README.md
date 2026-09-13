@@ -47,14 +47,18 @@ use it, so you can follow along without polling the index. Paste it into a feed 
 or into Home Assistant's own `feedreader` integration; open it in a browser and it
 renders as a page.
 
-**In the published index right now:** all 3 940 HACS repositories crawled
-(3 184 integrations and 756 Lovelace plugins, 29 unreachable), **855 affected**,
-**2 252 findings**, across 6 Home Assistant releases: 11 in 2026.10, 95 in 2026.11,
-11 in 2027.5, 50 in 2027.6, 29 in 2027.7 and 720 in 2027.8 (counted by distinct
-integration domain). 54 of the 125 announced removals have a matcher behind them; the
-board says so on itself, and the other 71 are carried for their deadline only.
-Every number comes from a real crawl; nothing is seeded or simulated. The daily job
-keeps these moving, and `coverage` in `index.json` is always authoritative.
+**In the published index right now:** all 4 009 HACS repositories crawled
+(3 244 integrations and 765 Lovelace plugins, 19 unreachable), **922 affected**,
+**2 504 findings**, across 8 Home Assistant releases: 11 in 2026.10, 96 in 2026.11,
+11 in 2027.5, 51 in 2027.6, 28 in 2027.7, 735 in 2027.8, 142 in 2027.9 and 1 in 2027.10
+(counted by distinct integration domain). 63 of the 123 announced removals have a
+matcher behind them; the board says so on itself, and the other 60 are carried for
+their deadline only. Three markers are refused as too vague to match, which the board
+also states: `InfraredEntity`, a class name too short to match on its own, and the two
+English words the extractor used to mistake for keyword names; a short name pinned to
+its module or scoped to its entity base class is matched anyway. Every number comes
+from a real crawl; nothing is seeded or simulated.
+The daily job keeps these moving, and `coverage` in `index.json` is always authoritative.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/Booyaka101/hass-breakage-radar/main/images/board.png"
@@ -135,6 +139,10 @@ Assistant install.
 ## Install (Home Assistant side)
 
 ### Via HACS (custom repository)
+
+[![Open your Home Assistant instance and open this repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Booyaka101&repository=hass-breakage-radar&category=integration)
+
+Or by hand:
 
 1. HACS → ⋮ → **Custom repositories**
 2. URL `https://github.com/Booyaka101/hass-breakage-radar`, category **Integration**
@@ -390,6 +398,15 @@ Real finds from that crawl, each hand-verified against the repository's own sour
 revisits repositories that actually changed. `--limit` caps a run; least-recently-scanned
 repositories go first, so coverage rotates on its own.
 
+A slice is almost entirely waiting on the network: the 1.12.0 rescan measured under ten
+percent CPU. Tarballs are therefore downloaded `--workers` at a time, ahead of the scan,
+and every tag tarball is kept under `.cache/tarballs/` once fetched. A tag never moves,
+so a cached one is right for as long as the catalogue points at it, and a rules or engine
+change that requeues the whole catalogue becomes a local job of minutes rather than a
+day of downloads. The whole catalogue is about 2.4 GB on disk, and branches are never
+cached. CI passes `--no-tarball-cache`, because a
+fresh runner would spend longer uploading the cache than it saved.
+
 ### The crawl conflicts with open pull requests, and that hides checks
 
 The crawl commits `data/rules.json`, `docs/` and `state/` daily. A branch that touches
@@ -447,13 +464,52 @@ a matcher only when it names something specific enough:
 
 * `"calls async_device_info_to_link_from_entity, which is deprecated…"` → a `call`
   matcher, pinned to the module that defines it.
-* `"doesn't specify unit_class when calling async_import_statistics"` → a
-  `call_missing_kwarg` matcher.
-* `"calls `async_listen` which is deprecated"` → **no matcher.** `async_listen` is 12
-  characters and everybody has one. It ships as information only.
+* `"doesn't specify unit_class when calling async_import_statistics"` → read off
+  the `if` the marker sits under, not off the sentence. `if "unit_class" not in
+  metadata` is a key of the `metadata` argument, so it becomes a
+  `call_missing_arg_key` matcher; `if new_unit_of_measurement is not UNDEFINED and
+  new_unit_class is UNDEFINED` is a real keyword, and the first half of it becomes
+  `requires`. The prose cannot tell those apart, and reading it as a keyword is what
+  shipped 99 wrong findings in 1.11.0: `unit_class=` is not a keyword
+  `async_import_statistics` accepts at all, so the matcher fired on every caller,
+  correct ones included. The enclosing `def` is also the target, because core's
+  `mean_type` marker inside `async_add_external_statistics` names
+  `async_import_statistics`. A guard neither shape fits is published as prose and
+  recorded in `discarded_markers` as `unreadable_guard`.
+* `"calls `async_listen` which is deprecated"` → a `call` matcher pinned to
+  `homeassistant.components.labs.helpers`. `async_listen` is 12 characters and everybody
+  has one, so the pin is what makes it a rule: the engine only fires where the file's
+  imports prove the call reaches that module, and `self.async_listen(...)` or
+  `from .bus import async_listen` never do.
+* a marker on a property of a Home Assistant entity base class → an `attr` matcher
+  **scoped to that class**. The 2026.9 removal of vacuum `battery_level` reads as
+  `{"type": "attr", "names": ["battery_level"], "in_class_base": ["StateVacuumEntity"]}`,
+  so a class deriving from `StateVacuumEntity` is a finding and `class Foo:
+  battery_level = 50` is not.
 
-Auto-derived symbols must be at least 18 characters and survive a denylist. Everything
-else is published for the board but never claims a repository is affected.
+A *bare* auto-derived symbol must still be at least 18 characters and survive a denylist,
+because on its own it would match everybody's own helper of the same name. Bare means
+neither pinned to the core module that defines it nor scoped to the class it is
+deprecated on; in both cases what identifies the deprecation is the pair, not the word,
+and the length gate does not apply. Since every `call` matcher carries its module, the
+gate is left with deprecated class names, which have no such proof. Everything else is
+published for the board but never claims a repository is affected, and the count of
+markers dropped that way is on the board, in `counts.markers_discarded`, and in what
+`tools/check_local.py` prints before its verdict.
+
+Scoping only fires for classes integrations are meant to subclass, which Home Assistant
+names `<Domain>Entity`. A deprecation on `ConfigFlow` or `DeviceRegistry` gets no scoped
+rule: nobody overrides those, so the rule would never match anything. That is a
+deliberate undercount.
+
+A keyword the prose supplies gets the same treatment. Core writes *"calls
+`async_get_or_create` with a `via_device` referencing the device itself"*, and reading
+"calls X with Y" off that sentence yields the keyword `a`. Until 1.12.0 two such rules
+shipped matchable and could never fire. A derived keyword now has to be plausible as a
+Python one: never a stopword, and if it is under four characters or carries no
+underscore it has to appear verbatim as a parameter name somewhere in the same core
+file. Rejected markers are published as prose and counted in
+`counts.markers_discarded`, so the gap is a number rather than a silence.
 
 The same pass also reads core's *other* removal mechanism, which has nothing to do with
 `report_usage`. A module declares
@@ -468,6 +524,11 @@ imported from the replacement path is the fix rather than the problem.
 prose with no `report_usage` call behind them — the legacy device tracker platform API,
 the device registry single-config-entry changes, the device tracker property removals.
 Each one quotes its source post.
+
+Core sometimes carries a marker for the same removal whose message is prose the
+extractor cannot turn into a matcher. A hand-written rule can name those ids in
+`supersedes`, and the merge drops them: two board entries for one deprecation, one of
+them with no matcher and no advice, reads as two problems.
 
 **3. Blog prose (`origin: blog`).** Every removal sentence found on
 <https://developers.home-assistant.io/blog/>, published as `matchable: false` so the
@@ -506,9 +567,11 @@ an implausible fraction of the catalogue is visible rather than quietly taxing e
 | `attr` | a property or `_attr_` assignment named in `names` |
 | `attr_access` | reading `something.<name>` |
 | `attr_access_typed` | reading `something.<name>` where the receiver is first proved, by single-file inference, to come from the helper module the matcher names — built for `DeviceEntry.config_entries`, whose name collides with `hass.config_entries` |
+| `container_use` | a *deprecated use* of a container attribute on a proved registry: subscription, a lookup method, or membership by device id on `registry.devices`. Iterating the very same attribute stays supported |
 | `call` | a call to one of `names` |
 | `call_kwarg` | a call to one of `names` passing any keyword in `kwargs` |
-| `call_missing_kwarg` | a call to one of `names` *not* passing `kwarg` |
+| `call_missing_kwarg` | a call to one of `names` *not* passing `kwarg`, and passing every keyword in `requires` if there is one — core arms some of these checks only when a related keyword is present |
+| `call_missing_arg_key` | a call to one of `names` whose mapping argument (`arg`, `arg_index`) provably does not set `key`. For options core takes inside a `TypedDict` argument rather than as keywords: a dict literal, a `constructors` call, or a local or module-level name that resolves to one. A mapping the file cannot read in full — spread from `**`, built by a helper, mutated through `update()`, handed in as a parameter — is never a finding |
 | `call_hass_argument` | a call to one of `names` that passes `hass` — for `@deprecated_hass_argument`, where the *argument* is deprecated, not the function |
 | `import_from` | `from <module in modules> import <name in names>` — for core's other removal mechanism, `_DEPRECATED_X = DeprecatedAlias(...)` behind a module `__getattr__`, where the import itself is what breaks. The module is the whole rule: the same name imported from the replacement path is the fix |
 | `js` | an anchored `token` in `.js`/`.ts`/`.mjs` source, comments stripped, only in files that reference the WebSocket API. Built for the device registry WebSocket deprecations, which break Lovelace cards rather than Python integrations |
@@ -516,9 +579,10 @@ an implausible fraction of the catalogue is visible rather than quietly taxing e
 Any matcher can be narrowed with `files` (exact basenames); `attr` matchers can also
 require `in_class_base`.
 
-`attr_access_typed` needs to know what counts as proof, so it carries the helper
-module it trusts rather than hard-coding one. Its keys, as used by
-`device-entry-config-entries` in `data/manual_rules.json`:
+`attr_access_typed` and `container_use` need to know what counts as proof, so they
+carry the helper module they trust rather than hard-coding one. Both walk the same
+scope inference. The keys, as used by `device-entry-config-entries` and
+`device-registry-devices-mapping` in `data/manual_rules.json`:
 
 | Key | Meaning |
 |---|---|
@@ -530,10 +594,21 @@ module it trusts rather than hard-coding one. Its keys, as used by
 | `entry_containers` | mappings on a proved registry whose values are entries, e.g. `devices` |
 | `entry_functions` | module-level functions returning entries, resolved through the import map |
 | `entry_params` | `{function name: 1-based parameter}` typed by a platform contract rather than by an annotation |
+| `container` | (`container_use`) the attribute on the registry the rule is about, e.g. `devices` |
+| `uses` | (`container_use`) which uses of it break: `subscript`, `method`, `membership`, or `any` for an attribute deprecated outright |
+| `methods` | (`container_use`) the lookup methods that count, e.g. `get`, `values`, `keys` |
 
 Names are proved per scope, nested scopes inherit their enclosing one, and a registry
 assigned to an attribute (`self._registry = dr.async_get(hass)`) is proved for the
 whole class, since that assignment usually lives in `__init__` and the lookups do not.
+
+`container_use` exists because `registry.devices` is not deprecated. Using it as a
+mapping is. Core's replacement is a view whose `__getitem__`, `__contains__` and
+`__getattr__` report, while `__iter__` and `__len__` do not, so `reg.devices[device_id]`
+and `reg.devices.get(x)` break in 2027.9 while `for device in reg.devices` and
+`len(reg.devices)` do not. Membership fires only where the left operand reads like a
+device id, meaning a string literal or a name ending `_id`, because core reports string
+membership only, and `device_entry in reg.devices` is the supported form.
 
 The engine lives in `tools/rules_engine.py` and is vendored byte-for-byte at
 `custom_components/breakage_radar/rules_engine.py`, so the crawler and the
@@ -695,6 +770,8 @@ For the crawler:
 | Rescan everything | `tools/scan.py --force` | off |
 | One repository | `tools/scan.py --only owner/repo` | — |
 | Politeness pause | `tools/scan.py --sleep 0.25` | `0` |
+| Downloads in flight | `tools/scan.py --workers 16` | `8` |
+| Tag tarball cache | `tools/scan.py --tarball-cache DIR`, `--no-tarball-cache` | `.cache/tarballs` |
 | Core branch | `tools/extract_rules.py --ref dev` | `dev` |
 | Skip the blog crawl | `tools/blog_rules.py --no-network` | off |
 | Force the catalogue fallback | `tools/catalog.py --force-fallback` | off |
@@ -763,7 +840,7 @@ real package is used instead.
   method name on an object whose type is only known at runtime.
 * **Index coverage is partial by design.** One slice is capped so the daily job stays
   inside GitHub's rate limits; `coverage.repos_scanned` always states how much of the
-  3 088-repo catalogue has been visited so far. Since 1.1.0 this matters less on your
+  4 009-repo catalogue has been visited so far. Since 1.1.0 this matters less on your
   own box: whatever the crawl has not reached, the integration scans locally with the
   same rules.
 * **The local scan is bounded.** Per integration it reads at most 400 Python files of
@@ -781,6 +858,12 @@ real package is used instead.
   `hass.config_entries` among them. A missed
   call is a rule that stays quiet; a wrong one would waste a maintainer's afternoon,
   so the matcher is built to under-report.
+* **A scoped `attr` rule resolves base classes one level, inside one file.** A class
+  deriving from `StateVacuumEntity` is matched whether it names the base directly, under
+  an import alias, dotted as `vacuum.StateVacuumEntity`, among several bases, or through
+  an intermediate class defined in the same file. A chain that leaves the file
+  (`from .base import BaseVacuum`) is not followed, because nothing in the file proves
+  what `.base` derives from. Undercounting, again on purpose.
 * **`imminent` is computed from the release schedule, `broken_now` is not.** The
   first-Wednesday rule is Home Assistant's published schedule and has been exact all
   year, but it is applied locally, not fetched — a release moved for a one-off reason

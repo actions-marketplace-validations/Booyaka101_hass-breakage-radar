@@ -4,7 +4,7 @@ A *rule* says "this piece of Python stops working in Home Assistant release X".
 A *matcher* is the machine-checkable half of a rule.  :func:`match_source` runs
 every matcher over one parsed file and yields findings.
 
-Ten matcher types cover every deprecation Breakage Radar currently ships:
+Twelve matcher types cover every deprecation Breakage Radar currently ships:
 
 ``moduledef``          a module-level ``def``/``async def`` with one of ``names``
 ``classbase``          a ``class`` whose base list mentions one of ``bases``
@@ -13,9 +13,20 @@ Ten matcher types cover every deprecation Breakage Radar currently ships:
 ``attr_access_typed``  ``attr_access`` restricted to receivers proved, by
                        single-file inference, to hold an object from the
                        helper module the matcher names
+``container_use``      a *deprecated use* of a container attribute on such a
+                       proved receiver -- subscription, a lookup method or
+                       string membership on ``registry.devices``, where
+                       iterating the very same container is still supported
 ``call``               a call to one of ``names`` (bare or attribute access)
 ``call_kwarg``         a call to one of ``names`` passing any keyword in ``kwargs``
-``call_missing_kwarg`` a call to one of ``names`` *not* passing keyword ``kwarg``
+``call_missing_kwarg`` a call to one of ``names`` *not* passing keyword ``kwarg``,
+                       optionally only where every keyword in ``requires`` *is*
+                       passed -- core arms some of these checks conditionally
+``call_missing_arg_key``
+                       a call to one of ``names`` whose mapping argument (``arg``,
+                       ``arg_index``) provably does not set ``key``. For options
+                       core takes inside a ``TypedDict`` argument rather than as
+                       keywords, where a missing key is not visible on the call
 ``call_hass_argument`` a call to one of ``names`` that passes ``hass`` (first
                        positional or keyword) -- for ``@deprecated_hass_argument``,
                        where the *argument* is deprecated, not the function
@@ -29,10 +40,11 @@ Ten matcher types cover every deprecation Breakage Radar currently ships:
 
 Every matcher may additionally be constrained with ``files`` (a list of exact
 basenames, e.g. ``["device_tracker.py"]``), ``attr`` matchers with
-``in_class_base`` (the enclosing class must derive from one of these names),
-and ``call`` matchers with ``not_awaited`` (skip awaited calls, for symbols
-Home Assistant defines with a plain ``def``). Those constraints are what keep
-the false-positive rate at zero on lookalike code -- see
+``in_class_base`` (the enclosing class must derive from one of these names,
+resolved through the file's import aliases and through one level of local
+subclassing), and ``call`` matchers with ``not_awaited`` (skip awaited calls,
+for symbols Home Assistant defines with a plain ``def``). Those constraints
+are what keep the false-positive rate at zero on lookalike code -- see
 ``tests/test_scanner.py``.
 
 Standard library only: this module is imported by the crawler and vendored
@@ -47,7 +59,7 @@ import ast
 import re
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from typing import Any, Iterable, Iterator
+from typing import Any, Collection, Iterable, Iterator
 
 MATCHER_TYPES = frozenset(
     {
@@ -56,9 +68,11 @@ MATCHER_TYPES = frozenset(
         "attr",
         "attr_access",
         "attr_access_typed",
+        "container_use",
         "call",
         "call_kwarg",
         "call_missing_kwarg",
+        "call_missing_arg_key",
         "call_hass_argument",
         "import_from",
         "js",
@@ -68,7 +82,7 @@ MATCHER_TYPES = frozenset(
 #: Bumped whenever matching semantics change. It is folded into the crawl's
 #: rules hash, so an engine change forces a rescan instead of leaving stale
 #: findings that the current engine would no longer produce.
-ENGINE_VERSION = 7
+ENGINE_VERSION = 10
 
 VERSION_RE = re.compile(r"^\d{4}\.\d+(?:\.\d+)?$")
 
@@ -145,6 +159,16 @@ class Finding:
         }
 
 
+def search_term(symbol: str) -> str:
+    """The searchable part of a rule symbol.
+
+    ``DeviceRegistry.async_get_device`` and
+    ``async_import_statistics(missing metadata)`` both reduce to the bare
+    function name, which is what someone would paste into an issue.
+    """
+    return symbol.split("(")[0].strip().split(".")[-1].strip()
+
+
 @dataclass
 class ScanStats:
     """Counters a caller can surface instead of silently swallowing problems."""
@@ -209,8 +233,13 @@ def _basename(path: str) -> str:
     return PurePosixPath(path).name
 
 
-def _base_names(node: ast.ClassDef) -> set[str]:
-    """Names in a class's base list, both ``Foo`` and ``mod.Foo`` forms."""
+def base_names(node: ast.ClassDef, imports: dict[str, str] | None = None) -> set[str]:
+    """Names in a class's base list, both ``Foo`` and ``mod.Foo`` forms.
+
+    ``imports`` adds the name a base was imported under upstream, so
+    ``from homeassistant.components.vacuum import StateVacuumEntity as Base``
+    followed by ``class MyVacuum(Base)`` still names ``StateVacuumEntity``.
+    """
     names: set[str] = set()
     for base in node.bases:
         if isinstance(base, ast.Name):
@@ -223,6 +252,13 @@ def _base_names(node: ast.ClassDef) -> set[str]:
                 names.add(inner.id)
             elif isinstance(inner, ast.Attribute):
                 names.add(inner.attr)
+    if imports:
+        for name in sorted(names):
+            dotted = imports.get(name)
+            # A relative import is the repository's own class, never core's,
+            # however suggestive the name it was bound to.
+            if dotted and not dotted.startswith("."):
+                names.add(dotted.rsplit(".", 1)[-1])
     return names
 
 
@@ -336,7 +372,7 @@ def _file_allowed(matcher: dict[str, Any], path: str) -> bool:
     return _basename(path) in set(allowed)
 
 
-def _decorated_as_property(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+def decorated_as_property(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     for decorator in node.decorator_list:
         target = decorator.func if isinstance(decorator, ast.Call) else decorator
         if isinstance(target, ast.Name) and target.id in (
@@ -368,9 +404,24 @@ def _match_classbase(
 ) -> Iterator[tuple[int, str]]:
     wanted = set(matcher.get("bases", ()))
     for node in _iter_classes(tree):
-        hit = _base_names(node) & wanted
+        hit = base_names(node, imports) & wanted
         if hit:
             yield node.lineno, sorted(hit)[0]
+
+
+def _inherited_bases(tree: ast.Module, imports: dict[str, str]) -> dict[str, set[str]]:
+    """Base names per class, following a base defined in the same file once.
+
+    ``class Middle(StateVacuumEntity)`` then ``class MyVacuum(Middle)`` puts
+    ``StateVacuumEntity`` on ``MyVacuum`` too. One level only: a chain that
+    leaves the file cannot be resolved from the file, and undercounting is the
+    side to be wrong on.
+    """
+    direct = {node.name: base_names(node, imports) for node in _iter_classes(tree)}
+    return {
+        name: bases | set().union(*(direct.get(b, set()) for b in bases if b != name))
+        for name, bases in direct.items()
+    }
 
 
 def _match_attr(
@@ -379,13 +430,14 @@ def _match_attr(
     names = set(matcher.get("names", ()))
     attr_names = {f"_attr_{name}" for name in names}
     required_bases = set(matcher.get("in_class_base", ()))
+    inherited = _inherited_bases(tree, imports) if required_bases else {}
 
     for node in _iter_classes(tree):
-        if required_bases and not (_base_names(node) & required_bases):
+        if required_bases and not (inherited.get(node.name, set()) & required_bases):
             continue
         for child in ast.walk(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if child.name in names and _decorated_as_property(child):
+                if child.name in names and decorated_as_property(child):
                     yield child.lineno, child.name
             elif isinstance(child, ast.Assign):
                 for target in child.targets:
@@ -610,22 +662,37 @@ def _entry_call(
     return False
 
 
+def _is_registry_container(
+    matcher: dict[str, Any],
+    node: ast.expr,
+    imports: dict[str, str],
+    receivers: set[str],
+    containers: Collection[str],
+) -> bool:
+    """``registry.devices`` and friends: a proved registry's own container.
+
+    The receiver counts either because the scope bound it from the factory
+    (``reg = dr.async_get(hass)``) or because the factory call is chained
+    straight into the read.
+    """
+    if not (isinstance(node, ast.Attribute) and node.attr in containers):
+        return False
+    if _dotted(node.value) in receivers:
+        return True
+    return isinstance(node.value, ast.Call) and _is_factory_call(
+        matcher, node.value, imports
+    )
+
+
 def _is_entry_container(
     matcher: dict[str, Any],
     node: ast.expr,
     imports: dict[str, str],
     receivers: set[str],
 ) -> bool:
-    """``registry.devices`` and friends: a proved registry's own mapping."""
-    if not (
-        isinstance(node, ast.Attribute)
-        and node.attr in set(matcher.get("entry_containers", ()))
-    ):
-        return False
-    if _dotted(node.value) in receivers:
-        return True
-    return isinstance(node.value, ast.Call) and _is_factory_call(
-        matcher, node.value, imports
+    """The containers an ``attr_access_typed`` matcher says hold entries."""
+    return _is_registry_container(
+        matcher, node, imports, receivers, matcher.get("entry_containers") or ()
     )
 
 
@@ -722,25 +789,22 @@ def _contract_parameter(
     return params[index - 1].arg if 0 <= index - 1 < len(params) else None
 
 
-def _match_attr_access_typed(
+def _walk_typed_scopes(
     matcher: dict[str, Any], tree: ast.Module, imports: dict[str, str]
-) -> Iterator[tuple[int, str]]:
-    """``attr_access`` gated on proving what the receiver is.
+) -> Iterator[tuple[ast.AST, set[str], set[str]]]:
+    """Every node of the file, paired with what its scope proves.
 
-    Exists for ``DeviceEntry.config_entries``, whose name collides with the
-    ubiquitous ``hass.config_entries``: a plain ``attr_access`` matcher would
-    fire on nearly every integration ever written. This one is an allowlist of
-    proven receivers -- an attribute read fires only off a name proved in the
-    scope that reads it, or chained straight off a registry lookup. Everything
-    else, ``hass.config_entries`` included, never matches.
+    Yields ``(node, receivers, entries)``: the registry-typed names in scope
+    and the entry-typed ones. Inference is per scope and flow-insensitive: a
+    name proved anywhere in a function counts everywhere in it, and nested
+    scopes inherit what encloses them, the way a closure really does read
+    those names. A registry assigned to an attribute is proved for its whole
+    class, because that assignment lives in ``__init__`` and the lookups do
+    not.
 
-    Inference is per scope and flow-insensitive: a name proved anywhere in a
-    function counts everywhere in it, and nested scopes inherit what encloses
-    them, the way a closure really does read those names. A registry assigned
-    to an attribute is proved for its whole class, because that assignment
-    lives in ``__init__`` and the lookups do not.
+    Both receiver-aware matchers walk here. Which node shapes count as a
+    finding is the only part that differs between them.
     """
-    names = set(matcher.get("names", ()))
 
     def visit(
         func: ast.AST | None,
@@ -749,7 +813,7 @@ def _match_attr_access_typed(
         entries: set[str],
         contracted: str | None,
         module_level: bool,
-    ) -> Iterator[tuple[int, str]]:
+    ) -> Iterator[tuple[ast.AST, set[str], set[str]]]:
         own, nested = _scope_nodes(body)
         receivers, entries = _scope_bindings(
             matcher, func, own, imports, receivers, entries
@@ -757,17 +821,7 @@ def _match_attr_access_typed(
         if contracted:  # after shadowing: it is this function's own parameter
             entries.add(contracted)
         for node in own:
-            if not (
-                isinstance(node, ast.Attribute)
-                and node.attr in names
-                and isinstance(node.ctx, ast.Load)
-            ):
-                continue
-            value = node.value
-            if isinstance(value, ast.Name) and value.id in entries:
-                yield node.lineno, node.attr
-            elif _yields_entry(matcher, value, imports, receivers):
-                yield node.lineno, node.attr
+            yield node, receivers, entries
         for child in nested:
             inherited = receivers
             if isinstance(child, ast.ClassDef):
@@ -782,6 +836,148 @@ def _match_attr_access_typed(
             )
 
     yield from visit(None, tree.body, set(), set(), None, True)
+
+
+def _match_attr_access_typed(
+    matcher: dict[str, Any], tree: ast.Module, imports: dict[str, str]
+) -> Iterator[tuple[int, str]]:
+    """``attr_access`` gated on proving what the receiver is.
+
+    Exists for ``DeviceEntry.config_entries``, whose name collides with the
+    ubiquitous ``hass.config_entries``: a plain ``attr_access`` matcher would
+    fire on nearly every integration ever written. This one is an allowlist of
+    proven receivers -- an attribute read fires only off a name proved in the
+    scope that reads it, or chained straight off a registry lookup. Everything
+    else, ``hass.config_entries`` included, never matches.
+    """
+    names = set(matcher.get("names", ()))
+    for node, receivers, entries in _walk_typed_scopes(matcher, tree, imports):
+        if not (
+            isinstance(node, ast.Attribute)
+            and node.attr in names
+            and isinstance(node.ctx, ast.Load)
+        ):
+            continue
+        value = node.value
+        if isinstance(value, ast.Name) and value.id in entries:
+            yield node.lineno, node.attr
+        elif _yields_entry(matcher, value, imports, receivers):
+            yield node.lineno, node.attr
+
+
+def _reads_like_a_key(node: ast.expr) -> bool:
+    """Whether ``x`` in ``x in registry.devices`` reads like a device id.
+
+    Core's ``__contains__`` reports only when the operand is a ``str``;
+    ``some_entry in registry.devices`` is the supported value membership and
+    has to stay silent. Nothing in a single file proves the type, so the test
+    is the spelling: a string literal, or a name or attribute ending ``_id``,
+    which covers the ``device_id`` and ``entry_id`` this ecosystem writes.
+    Undercounting is the side to be wrong on.
+    """
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str)
+    if isinstance(node, ast.Attribute):
+        return node.attr.endswith("_id")
+    return isinstance(node, ast.Name) and node.id.endswith("_id")
+
+
+def _module_in_reach(matcher: dict[str, Any], imports: dict[str, str]) -> bool:
+    """Whether anything the file imports could resolve to the matcher's module.
+
+    A ``container_use`` receiver is proved only through the import map -- the
+    factory call or a registry annotation -- so a file that binds nothing on
+    that path cannot prove one, and walking it is wasted work on the user's own
+    Home Assistant. The test is a shared prefix, not equality, because plain
+    ``import homeassistant`` binds the package root and still reaches the
+    module through it.
+
+    ``attr_access_typed`` deliberately does not use this: ``entry_params``
+    proves a parameter from the platform contract, with no import at all.
+    """
+    module = matcher.get("module", "")
+    if not module:
+        return True
+    return any(
+        target == module
+        or target.startswith(f"{module}.")
+        or module.startswith(f"{target}.")
+        for target in imports.values()
+    )
+
+
+def _match_container_use(
+    matcher: dict[str, Any], tree: ast.Module, imports: dict[str, str]
+) -> Iterator[tuple[int, str]]:
+    """Deprecated *use* of a container attribute on a proved registry object.
+
+    ``DeviceRegistry.devices`` is not deprecated. It is a view whose
+    ``__getitem__``, ``__contains__`` and ``__getattr__`` report, while
+    ``__iter__`` and ``__len__`` do not, so ``reg.devices[device_id]``,
+    ``reg.devices.get(x)`` and ``.values()`` break in 2027.9 while
+    ``for device in reg.devices``, ``len(reg.devices)`` and handing the view
+    to somebody else stay supported. Naming the attribute would therefore be
+    wrong on most real call sites, which is why the *use* is what this
+    matcher names. ``uses: ["any"]`` is the other case, where the attribute
+    is deprecated outright: ``deleted_devices``.
+
+    The receiver is proved the way ``attr_access_typed`` proves one, and for
+    the same reason: ``devices`` is a field on half the coordinators in the
+    ecosystem.
+    """
+    container = matcher.get("container")
+    if not container or not _module_in_reach(matcher, imports):
+        return
+    containers = (container,)
+    uses = set(matcher.get("uses", ()))
+    methods = set(matcher.get("methods") or ())
+
+    def deprecated_use(node: ast.AST, receivers: set[str]) -> str | None:
+        """The symbol for the deprecated use at ``node``, or None."""
+
+        def on_registry(value: ast.AST) -> bool:
+            return isinstance(value, ast.expr) and _is_registry_container(
+                matcher, value, imports, receivers, containers
+            )
+
+        if "any" in uses:
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.ctx, ast.Load)
+                and on_registry(node)
+            ):
+                return container
+            return None
+        if (
+            "subscript" in uses
+            and isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, ast.Load)
+            and on_registry(node.value)
+        ):
+            return f"{container}[...]"
+        if (
+            "method" in uses
+            and isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, ast.Load)
+            and node.attr in methods
+            and on_registry(node.value)
+        ):
+            return f"{container}.{node.attr}"
+        if "membership" in uses and isinstance(node, ast.Compare):
+            operands = [node.left, *node.comparators]
+            for index, op in enumerate(node.ops):
+                if (
+                    isinstance(op, (ast.In, ast.NotIn))
+                    and on_registry(operands[index + 1])
+                    and _reads_like_a_key(operands[index])
+                ):
+                    return f"{container} in"
+        return None
+
+    for node, receivers, _entries in _walk_typed_scopes(matcher, tree, imports):
+        symbol = deprecated_use(node, receivers)
+        if symbol:
+            yield node.lineno, symbol
 
 
 def _matcher_kwargs(matcher: dict[str, Any]) -> set[str]:
@@ -808,8 +1004,16 @@ def _match_call_kwarg(
 def _match_call_missing_kwarg(
     matcher: dict[str, Any], tree: ast.Module, imports: dict[str, str]
 ) -> Iterator[tuple[int, str]]:
+    """A call that omits a keyword core now requires.
+
+    ``requires`` is the rest of core's own guard.
+    ``async_update_statistics_metadata`` only warns about a missing
+    ``new_unit_class`` when ``new_unit_of_measurement`` is passed too, so a
+    call that passes neither is healthy and has to stay silent.
+    """
     names = set(matcher.get("names", ()))
     kwarg = matcher.get("kwarg")
+    requires = set(matcher.get("requires", ()))
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and _called_name(node) in names:
             if not _module_allowed(matcher, node, _called_name(node), imports):
@@ -817,8 +1021,202 @@ def _match_call_missing_kwarg(
             # ``**kwargs`` (arg is None) could supply it -- do not guess.
             if any(keyword.arg is None for keyword in node.keywords):
                 continue
-            if not any(keyword.arg == kwarg for keyword in node.keywords):
+            passed = {keyword.arg for keyword in node.keywords}
+            if not requires <= passed:
+                continue
+            if kwarg not in passed:
                 yield node.lineno, f"{_called_name(node)}(no {kwarg})"
+
+
+#: Methods that add keys out of sight of the assignment that built the mapping.
+#: One of these on the name and the file can no longer say what it holds.
+MAPPING_MUTATORS = frozenset({"update", "setdefault", "pop", "popitem", "clear"})
+
+
+def _parents(tree: ast.Module) -> dict[ast.AST, ast.AST]:
+    return {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+
+def _enclosing_scope(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> ast.AST | None:
+    """The function or module whose body ``node`` sits in."""
+    current = parents.get(node)
+    while current is not None:
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+            return current
+        current = parents.get(current)
+    return None
+
+
+def _binds(target: ast.expr, name: str) -> bool:
+    return any(
+        isinstance(node, ast.Name) and node.id == name for node in ast.walk(target)
+    )
+
+
+def _mapping_keys(node: ast.expr, constructors: Collection[str]) -> set[str] | None:
+    """The keys a mapping expression sets, or ``None`` when it cannot be read.
+
+    A key counts as set wherever it is written, whatever the value: core tests
+    for the key itself, so ``{"unit_class": None}`` satisfies it.
+    """
+    if isinstance(node, ast.Dict):
+        keys = set()
+        for key in node.keys:
+            # ``{**base, "unit_class": x}``: ``base`` is not readable here.
+            if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+                return None
+            keys.add(key.value)
+        return keys
+    if isinstance(node, ast.Call):
+        # The TypedDict's own constructor, ``StatisticMetaData(unit_class=...)``.
+        if _called_name(node) not in constructors or node.args:
+            return None
+        if any(keyword.arg is None for keyword in node.keywords):
+            return None
+        return {keyword.arg for keyword in node.keywords}
+    return None
+
+
+def _keys_bound_in(
+    name: str, scope: ast.AST, constructors: Collection[str]
+) -> tuple[bool, set[str] | None]:
+    """``(bound, keys)`` for ``name`` in ``scope``; ``keys`` is None if unreadable.
+
+    Deliberately flow-insensitive and inclusive: every assignment anywhere in
+    the scope counts, nested scopes included. Over-collecting keys only ever
+    silences a finding, which is the side to be wrong on here. Anything that
+    could set a key out of sight -- a computed subscript, unpacking, a mutator
+    method, the name being a parameter -- reads as unreadable rather than as
+    empty.
+    """
+    if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        arguments = scope.args
+        if name in {
+            arg.arg
+            for arg in (*_all_args(scope), arguments.vararg, arguments.kwarg)
+            if arg is not None
+        }:
+            return True, None
+
+    keys: set[str] = set()
+    bound = False
+    for node in ast.walk(scope):
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    if node.value is None:  # a bare ``x: SomeType`` annotation
+                        return True, None
+                    from_value = _mapping_keys(node.value, constructors)
+                    if from_value is None:
+                        return True, None
+                    keys |= from_value
+                    bound = True
+                elif (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == name
+                ):
+                    if not (
+                        isinstance(target.slice, ast.Constant)
+                        and isinstance(target.slice.value, str)
+                    ):
+                        return True, None
+                    keys.add(target.slice.value)
+                    bound = True
+                elif isinstance(target, (ast.Tuple, ast.List)) and _binds(target, name):
+                    return True, None
+        elif isinstance(node, ast.AugAssign) and _binds(node.target, name):
+            return True, None
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)) and _binds(
+            node.target, name
+        ):
+            return True, None
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+            if _binds(node.optional_vars, name):
+                return True, None
+        elif isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
+            return True, None
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if (
+                isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id == name
+                and func.attr in MAPPING_MUTATORS
+            ):
+                return True, None
+    return bound, keys
+
+
+def _mapping_argument(node: ast.Call, matcher: dict[str, Any]) -> ast.expr | None:
+    """The mapping this call passes, positionally or by keyword."""
+    index = matcher.get("arg_index")
+    if index is not None and len(node.args) > index:
+        # A ``*args`` ahead of the slot moves whatever lands in it.
+        if any(isinstance(arg, ast.Starred) for arg in node.args[: index + 1]):
+            return None
+        return node.args[index]
+    return next(
+        (k.value for k in node.keywords if k.arg and k.arg == matcher.get("arg")),
+        None,
+    )
+
+
+def _resolve_mapping_name(
+    name: str,
+    node: ast.Call,
+    parents: dict[ast.AST, ast.AST],
+    constructors: Collection[str],
+) -> set[str] | None:
+    """Follow a name to the keys it holds, innermost scope outwards."""
+    scope = _enclosing_scope(node, parents)
+    while scope is not None:
+        bound, keys = _keys_bound_in(name, scope, constructors)
+        if bound:
+            return keys
+        scope = _enclosing_scope(scope, parents)
+    return None
+
+
+def _match_call_missing_arg_key(
+    matcher: dict[str, Any], tree: ast.Module, imports: dict[str, str]
+) -> Iterator[tuple[int, str]]:
+    """A call whose mapping argument provably does not set a required key.
+
+    Core's statistics helpers take their options inside ``metadata``, not as
+    keywords, so ``async_add_external_statistics(hass, metadata, stats)`` can
+    never pass ``unit_class=`` at all. Reading that guard as a keyword shipped
+    99 wrong findings over 96 integrations in 1.11.0 and was reported twice
+    (ReikanYsora/Helios-Forecast#38,
+    barisdemirdelen/homeassistant-greenchoice#66), both on code that sets the
+    key correctly. This one reads the mapping instead, and a mapping it cannot
+    read in full is never a finding.
+    """
+    names = set(matcher.get("names", ()))
+    key = matcher.get("key")
+    constructors = matcher.get("constructors", ())
+    parents: dict[ast.AST, ast.AST] | None = None
+
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and _called_name(node) in names):
+            continue
+        if not _module_allowed(matcher, node, _called_name(node), imports):
+            continue
+        argument = _mapping_argument(node, matcher)
+        if argument is None:
+            continue
+        keys = _mapping_keys(argument, constructors)
+        if keys is None and isinstance(argument, ast.Name):
+            if parents is None:
+                parents = _parents(tree)
+            keys = _resolve_mapping_name(argument.id, node, parents, constructors)
+        if keys is not None and key not in keys:
+            yield node.lineno, f"{_called_name(node)}(no {key})"
 
 
 def _looks_like_hass(node: ast.expr) -> bool:
@@ -1047,15 +1445,34 @@ def dedupe_js_findings(findings: list[Finding]) -> list[Finding]:
     return sorted(best.values(), key=lambda f: (f.file, f.line, f.rule_id))
 
 
+def _needles(matcher: dict[str, Any]) -> list[str]:
+    """Identifiers a file has to contain before ``matcher`` is worth running.
+
+    Every Python matcher fires on an identifier from its own list -- ``names``,
+    ``bases`` or the ``container`` -- and an identifier the parser saw is a
+    substring of the text it parsed, so a file with none of them cannot match.
+    That is checked on the source string before any walk, because the
+    receiver-aware matchers cost more than the parse did. Every shipped
+    identifier is ASCII, which is what makes the text test sound.
+    """
+    for key in ("names", "bases"):
+        if matcher.get(key):
+            return list(matcher[key])
+    container = matcher.get("container")
+    return [container] if container else []
+
+
 _DISPATCH = {
     "moduledef": _match_moduledef,
     "classbase": _match_classbase,
     "attr": _match_attr,
     "attr_access": _match_attr_access,
     "attr_access_typed": _match_attr_access_typed,
+    "container_use": _match_container_use,
     "call": _match_call,
     "call_kwarg": _match_call_kwarg,
     "call_missing_kwarg": _match_call_missing_kwarg,
+    "call_missing_arg_key": _match_call_missing_arg_key,
     "call_hass_argument": _match_call_hass_argument,
     "import_from": _match_import_from,
 }
@@ -1101,6 +1518,9 @@ def match_source(
             continue
         handler = _DISPATCH.get(matcher.get("type", ""))
         if handler is None or not _file_allowed(matcher, path):
+            continue
+        needles = _needles(matcher)
+        if needles and not any(needle in source for needle in needles):
             continue
         for line, symbol in handler(matcher, tree, imports):
             key = (rule.id, path, line)

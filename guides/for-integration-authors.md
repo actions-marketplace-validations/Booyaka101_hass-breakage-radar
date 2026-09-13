@@ -34,6 +34,21 @@ than something of yours that shares a method name. Those rules opt into
 firing anyway, because the alternative is missing real cases — but they are the
 findings most worth disputing.
 
+**A short name is only ever flagged inside the class it belongs to.** A rule for
+`battery_level` would be useless on its own, since half the ecosystem has a
+property by that name. What the rule actually says is "`battery_level` defined
+on a class deriving from `StateVacuumEntity`", and the finding names both. If
+your class does not derive from the base class in the message, that is a bug in
+the rule and worth reporting.
+
+**Sometimes the attribute is fine and only one way of using it is not.**
+`DeviceRegistry.devices` is not deprecated. Iterating it, taking its `len()`, or
+testing `device_entry in registry.devices` all keep working past 2027.9, and
+iteration is the migration Home Assistant is asking for. What breaks is using it
+as a mapping: `registry.devices[device_id]`, `.get()`, `.values()`, `.keys()`.
+The finding names the use, so the symbol reads `devices[...]` or `devices.get`
+rather than `devices`, and code that only iterates is never reported.
+
 ---
 
 ## Check it yourself first
@@ -198,6 +213,11 @@ the engine:
   `async_extract_entity_ids(hass, call)` on consecutive lines — one healthy, one
   not. A dedicated matcher now tells them apart, and one rule's hit count
   dropped from 1 to 0 as a result.
+* `registry.devices` is deprecated as a mapping and supported as an iterable,
+  on the same attribute. Written the obvious way, that rule would have flagged
+  `for device in registry.devices` on every integration that had already
+  migrated. The matcher reads the surrounding expression instead, which is why
+  only subscription, a lookup method and membership by device id are reported.
 
 Every rule's measured hit rate across the catalogue is published in
 `index.json`, precisely so a rule firing on an implausible fraction of

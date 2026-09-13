@@ -4,6 +4,449 @@ All notable changes to Breakage Radar. Versions follow
 [semver](https://semver.org/); the `custom_components/breakage_radar/manifest.json`
 and `pyproject.toml` versions always agree (enforced by a test).
 
+## 1.13.0 — 2026-09-11
+
+### The statistics metadata rules were reading a key as a keyword
+
+`unit_class` and `mean_type` are keys of the `metadata` mapping that
+`async_import_statistics` and `async_add_external_statistics` take as their
+second argument. Neither function accepts a keyword by those names, so
+`async_import_statistics(hass, metadata, statistics, unit_class="energy")` is
+not code anybody can write. The extractor read core's sentence, "doesn't
+specify unit_class when calling async_import_statistics", as a keyword name
+and built a `call_missing_kwarg` matcher out of it. A keyword that cannot be
+passed is a keyword that is always missing, so the rule fired on every call
+site in the catalogue, the ones that set both keys correctly included.
+
+Two maintainers reported it: ReikanYsora/Helios-Forecast#38 on 12 August, and
+barisdemirdelen/homeassistant-greenchoice#66 on 11 September with the code
+that proves it. Helios-Forecast had already restructured its metadata so that
+a static scanner would see the keys, with a comment saying so, and the board
+flagged it anyway.
+
+Measured against the 206 findings 1.11.0 shipped over 96 integrations, 26
+stand. Of the rest, 103 are call sites where the key or the keyword is
+provably set, and 74 are mappings the scanner cannot read in full, where "not
+visible here" was being reported as "missing". The last 3 are in a file that
+needs core's own Python 3.14 to parse, so the crawler judges them and this
+machine did not.
+
+The new matcher reads the mapping instead of the call. A dict literal, a
+`StatisticMetaData(...)` constructor, or a local or module-level name that
+resolves to one of those is readable, and a key written anywhere in it counts
+as set, value or not, because presence is what core tests for. A mapping
+spread from `**`, built by a helper, mutated through `update()`, subscripted
+with a computed key or handed in as a parameter is not readable, and nothing
+unreadable is ever a finding.
+
+    {"type": "call_missing_arg_key", "names": ["async_import_statistics"],
+     "modules": ["homeassistant.components.recorder.statistics"],
+     "key": "unit_class", "arg": "metadata", "arg_index": 1,
+     "constructors": ["StatisticMetaData"]}
+
+The extractor no longer derives any of this from the prose. It reads the `if`
+the marker sits under: `if "unit_class" not in metadata` is a mapping key, and
+`if new_unit_of_measurement is not UNDEFINED and new_unit_class is UNDEFINED`
+is a real keyword whose check is only armed when a new unit of measurement
+comes with it, which `call_missing_kwarg` now carries as `requires`. Renaming
+a statistic with `async_update_statistics_metadata` and no new unit was never
+a problem and is no longer reported. A guard that fits neither shape produces
+prose with no matcher and shows up in `discarded_markers` as
+`unreadable_guard`.
+
+Taking the target from the enclosing `def` rather than the sentence also fixes
+a rule that was missing entirely. Core's `mean_type` marker inside
+`async_add_external_statistics` says "when calling async_import_statistics",
+its own copy-paste, so both markers folded into one rule and the external
+half was invisible: 16 real findings in the same corpus that 1.11.0 never
+reported. There are now five statistics rules where there were four, and their
+ids changed with their meaning.
+
+`ENGINE_VERSION` is 10, which queues every repository for a rescan.
+
+## 1.12.0 — 2026-09-07
+
+### The device registry's containers, where the attribute is fine and the use is not
+
+Home Assistant's 24 August follow-up post deprecated three more things on the
+device registry, and one of them does not fit any matcher the radar had.
+`DeviceRegistry.devices` is still there and still supported. What breaks in
+2027.9 is *using it as a mapping*: "Using it as a mapping -- subscription,
+`.get()`, `.values()`, `.keys()`, or membership by device id (`device_id in
+registry.devices`) -- is deprecated." Iterating the same attribute is the
+blessed replacement. Core's own code says exactly this and says it precisely:
+`devices` now returns a `_DeprecatedDeviceRegistryItemsView` whose
+`__getitem__`, `__contains__` and `__getattr__` call `report_usage`, while
+`__iter__` and `__len__` do not.
+
+An `attr_access` rule on `devices` would have flagged every `for device in
+reg.devices` in the catalogue, which is the code people are being told to
+write. So the new matcher kind names the use, not the attribute.
+
+    {"type": "container_use", "container": "devices",
+     "uses": ["subscript", "method", "membership"],
+     "methods": ["get", "values", "keys", "items", "get_entry", "get_device"],
+     "module": "homeassistant.helpers.device_registry",
+     "registry_factory": "async_get", "registry_types": ["DeviceRegistry"]}
+
+`reg.devices[device_id]`, `reg.devices.get(x)` and `.values()` are findings.
+`for d in reg.devices`, `len(reg.devices)`, `list(reg.devices)` and handing the
+view to somebody else are not, because none of them reaches a reporting method.
+Membership is the one judgement call: core reports it only when the operand is
+a `str`, and `device_entry in reg.devices` is the supported value test, but
+nothing in a single file proves which one you wrote. The rule fires on a string
+literal or on a name or attribute ending `_id`, which is how this ecosystem
+spells a device id, and stays quiet otherwise. That undercounts, deliberately.
+
+`deleted_devices` is the simpler case. Core deprecated the whole attribute,
+"there is no supported public use", so the rule takes `uses: ["any"]` and any
+read of it on a proved registry is a finding.
+
+Both rules only fire on a receiver the file proves is a `DeviceRegistry`, the
+same proof `device-entry-config-entries` has used since 1.5.0. `devices` is a
+field on half the coordinators in this ecosystem and a rule that trusted the
+spelling would be useless.
+
+`ENGINE_VERSION` is 9, which queues every repository for a rescan.
+
+### One walker, two matchers
+
+The receiver proof is about a hundred lines of scope inference: parameters
+resolved through annotations, walrus bindings, a registry kept on `self`,
+shadowing, closures inheriting their enclosing scope. Copying it for the new
+matcher would have been the obvious move and the wrong one. It is now
+`_walk_typed_scopes(matcher, tree, imports)`, a generator yielding
+`(node, receivers, entries)`, and both matchers consume it. What they differ on
+is which node shapes count, which is the only part worth writing twice.
+
+That is a refactor of shipped matching code, so it was measured rather than
+argued. `match_source` was recorded over every rule in `data/rules.json`
+against core's own 10 090 Python files plus every fixture in the repository,
+through the 1.11.0 engine and through this one. The two outputs are byte for
+byte identical, 293 findings each, 34 of them on the rule the walker was
+extracted from. The same corpus covers the early-out below.
+
+`container_use` skips any file whose imports cannot reach
+`homeassistant.helpers.device_registry` at all, because its receiver can only
+be proved through the import map. Without it the three receiver-aware rules
+walked every file three times and the engine got 23% slower on a 2 000-file
+core scan, which the integration would have paid for on the user's own
+hardware. `attr_access_typed` deliberately does not take the same shortcut:
+its `entry_params` proves a parameter from the platform contract, with no
+import involved.
+
+### Five keywords, and the dict literal that is not matched
+
+`default_manufacturer`, `default_model` and `default_name` are deprecated on
+`DeviceInfo`, with the plain `manufacturer`, `model` and `name` as the
+replacement. `created_at` and `modified_at` "never had any effect, the values
+were ignored", so the fix is to delete the argument. All five ship as
+`call_kwarg` rules on `DeviceInfo(...)` and `async_get_or_create(...)`, the
+same shape `device-info-via-device` has had since it was written.
+
+They match the call forms only. A plain `{"default_name": ...}` dict literal
+handed to something else is not matched, because nothing in the file proves
+that dict is device info, and each rule says so in its own message rather than
+leaving an author to guess why their code scanned clean.
+
+One thing is not deduplicated on purpose. `registry.devices[x].config_entries`
+now fires both the new 2027.9 container rule and the existing 2027.8
+`device-entry-config-entries`. Those are two removals, in two releases, needing
+two different edits. Collapsing them would hide the earlier deadline.
+
+### Core's prose rules yield to the hand-written ones
+
+Core carries markers for both container deprecations, and the extractor turned
+them into prose rules with no matcher: `core-prose-uses-device-registry-devices-as-a-mapping-...`
+and `core-prose-accesses-device-registry-deleted-devices-...`. With a real
+matcher shipping for the same deprecation, the board was about to show each of
+them twice, once with advice and once without. A manual rule can now name the
+ids it replaces in `supersedes`, and the merge drops them, logging it the way
+the existing coverage drop already does.
+
+### Two rules that could never have fired
+
+`data/rules.json` shipped `core-call-async-get-or-create-a`, matchable, looking
+for `async_get_or_create(a=...)`. And `core-call-async-update-device-one`,
+matchable, looking for `async_update_device(one=...)`. Nobody writes those.
+The extractor reads "calls X with Y" out of core's prose, and core writes
+"calls `device_registry.async_get_or_create` with a `via_device` referencing
+the device itself", so the regex lifted the article. Two of the fifty-eight
+matchable rules 1.11.0 published were dead, and the count said otherwise.
+
+A derived keyword now has to be plausible as a Python one. Never a stopword
+(`a`, `an`, `the`, `one`, `both`, `either`, `any`, `its`, `this`, `some`,
+`no`), and if it is under four characters or carries no underscore it has to
+appear verbatim as a parameter name somewhere in the same core file. That is
+what keeps `unit_class` and a genuinely short keyword like `hass`, and what
+`the` can never satisfy. Rejected markers are published as prose, and counted:
+`counts.markers_discarded` goes from 1 to 3, with the symbol, the reason and
+the core line in `discarded_markers`, so the gap is a number rather than a
+silence.
+
+Regenerating `data/rules.json` from the same core tarball
+(`a556b8e9c5c6...`, core dev 2026.10) changes exactly eleven rules: the seven
+added, the two superseded prose rules dropped, and the two dead matchers turned
+into prose. Every other rule is byte for byte what 1.11.0 published.
+
+### The crawl waits on the network, so it now waits in parallel and only once
+
+Rescanning the catalogue for this release measured where the time goes: about
+nine minutes of CPU across two and a half hours of wall clock, one tarball at a
+time, for 4 009 repositories. The scanner was never the bottleneck. Every
+rules or engine change requeues the whole catalogue, and each of those was a
+day of re-downloading bytes that had not changed.
+
+Three things, each proved on its own.
+
+`tools/scan.py` keeps every tag tarball it downloads under `.cache/tarballs/`
+and reads it from there next time. A tag never moves, so a cached one is right
+for as long as the catalogue points at it; branches are never cached. A full
+rescan with a warm cache is a local job of minutes. CI passes
+`--no-tarball-cache`, because a fresh runner would spend longer uploading the
+cache than it saved.
+
+Downloads run `--workers` at a time (default 8), ahead of the scan, with at
+most twice that many tarballs in memory. The scan itself stays on the main
+thread in catalogue order, so the log, the checkpoints and the clean stop on a
+429 are exactly what they were. `scan_repo` judges a download made ahead the
+same way it judges its own: the exception, if there was one, is handed over
+rather than raised early.
+
+The engine now checks a file's text before it walks it. Every Python matcher
+fires on an identifier from its own list, and an identifier the parser saw is
+a substring of the text it parsed, so a file with none of them cannot match
+and the walk is skipped. On the 2 000-file core scan used to measure the
+`container_use` early-out, the whole 1.12.0 rule set went from 31.1 seconds to
+3.6, with the same 27 findings. The receiver-aware walkers were the cost, and
+they now run only on files that name the thing they are looking for. The two
+byte-for-byte corpus diffs above were rerun with this in place, over 10 098
+files: 293 findings through the 1.11.0 engine and the 1.12.0 rule set adds 16
+more on core's own source, and not one file differs.
+
+### What the re-crawl measured
+
+`ENGINE_VERSION` 9 requeues every catalogue repository, and all 4 009 were
+rescanned for this release, on the same Python 3.14 the daily crawl uses. The
+control is unusually good: the daily crawl published its own pass over the same
+catalogue the same day, on the old rules, so the two differ only in the rules.
+
+| Release | Daily crawl | This release |
+|---|---|---|
+| 2026.10 | 14 | 14 |
+| 2026.11 | 206 | 206 |
+| 2027.5 | 16 | 16 |
+| 2027.6 | 55 | 55 |
+| 2027.7 | 36 | 36 |
+| 2027.8 | 1 882 | 1 887 |
+| 2027.9 | 0 | 289 |
+| 2027.10 | 1 | 1 |
+
+Every release already on the board has exactly the count it had, and not one
+finding on an unchanged tag was lost, checked pairwise across all 3 981
+repositories scanned both times. The five extra on 2027.8 are two
+`Chance-Konstruktion` repositories that were unreachable for the daily crawl
+and answered for this one, on the same tags. Everything else new is 2027.9:
+289 findings across 142 repositories. Affected repositories go from 871 to 922;
+matchable rules from 58 to 63.
+
+By rule, across the whole catalogue:
+
+| Rule | Findings | Repositories |
+|---|---|---|
+| `device-registry-devices-mapping` | 259 | 132 |
+| `device-info-default-name` | 10 | 7 |
+| `device-registry-deleted-devices` | 9 | 4 |
+| `device-info-default-manufacturer` | 7 | 5 |
+| `device-info-default-model` | 4 | 4 |
+| `device-info-created-at` | 0 | 0 |
+| `device-info-modified-at` | 0 | 0 |
+
+`created_at` and `modified_at` find nothing across 4 009 repositories. Nobody
+passes them, which is what core's own note that they never had any effect would
+predict. The rules stay, because a matcher that never fires costs nothing and
+missing the one integration that does costs a breakage in 2027.9, but the board
+will show them at zero and that is the honest number.
+
+Six hits were checked by hand against the raw published source, not against the
+crawler's record of it:
+
+* `AlexxIT/XiaomiGateway3` v4.2.2, `hass/hass_utils.py:226`:
+  `for device in registry.devices.values():` on `registry =
+  device_registry.async_get(hass)`. Dropping `.values()` is the whole fix.
+* `MacSiem/ha-baby-tracker` v5.0.15, `websocket_api.py:54`: the same idiom.
+* `mxshmh/ha-metric` v1.0.0, `manager.py:208`:
+  `device_registry.devices.get(reg_entry.device_id)`, which becomes
+  `device_registry.async_get(...)`.
+* `pyalarmdotcom/alarmdotcom` v3.0.15, `__init__.py:94` and `:98`: iterates
+  `device_registry.deleted_devices.values()`, then
+  `del device_registry.deleted_devices[...]`. Neither has a replacement; that is
+  registry bookkeeping the integration should not be doing.
+* `gcobb321/icloud3` v3.5.1, `utils/entity_io.py:388`:
+  `if device_id not in device_reg.deleted_devices:`.
+* `tomaae/homeassistant-mikrotik_router` v2.2, `entity.py:278` and `:288`:
+  `DeviceInfo(default_name=..., default_manufacturer=..., via_device=...)`,
+  which is two 2027.9 findings and a 2027.8 one on the same line.
+
+The first pass of that rescan was wrong, and the pairwise check is what caught
+it. It ran on Python 3.11 while the rules were extracted on 3.14, so 1 519 files
+using newer syntax (`except A, B:` is 3.14, `type X = ...` is 3.12) failed to
+parse and were skipped, and 216 findings on unchanged tags disappeared without a
+word. The crawler now says so when its interpreter is older than the rule set's.
+
+
+## 1.11.0 — 2026-09-03
+
+### Short deprecated names are matchable when they are scoped to a base class
+
+Home Assistant 2026.9 removed `battery_level` from the base vacuum entity on
+2 September, and the radar had never warned a single integration author about
+it. Not because the marker was missing from core, but because `battery_level`
+is thirteen characters. `tools/extract_rules.py` refuses to build a matcher
+from a bare symbol under eighteen, for the good reason that a rule on
+`async_listen` or `battery_level` alone fires on every helper in the ecosystem
+that happens to share the word. The gate was right and the consequence was
+that a whole class of removal was invisible.
+
+The engine already had the answer. An `attr` matcher takes `in_class_base`,
+"the enclosing class must derive from one of these", and the hand-written
+device tracker rules have used it since 1.0.0. What was missing was on the
+extraction side: nothing derived that scope from core's own source. It does
+now. When a marker sits on a property of a Home Assistant entity base class,
+the rule records the class alongside the symbol and emits
+
+    {"type": "attr", "names": ["battery_level"],
+     "in_class_base": ["StateVacuumEntity"]}
+
+A symbol pinned to the class it is deprecated on is no longer bare, so the
+eighteen-character gate does not apply to it. Bare symbols still go through
+the gate and the denylist exactly as before, and no existing rule changed:
+regenerating `data/rules.json` against the same core tarball produces byte-
+identical output for every rule that was already there.
+
+Core does not always name the attribute at the marker. The vacuum warning
+lives in a private `_report_deprecated_battery_properties(property)` and the
+names reach it as string literals from a sibling call site in the same class,
+which is why nothing textual ever found them. The extractor reads those call
+sites, so one marker becomes one rule per attribute it names. Run against the
+real core 2026.8 source, it produces `core-attr-statevacuumentity-battery-level`
+and `core-attr-statevacuumentity-battery-icon`, the two rules that would have
+warned vacuum authors in the month before the removal landed. Run over the
+twelve vacuum integrations in the HACS catalogue, those rules find
+`Jezza34000/homeassistant_weback_component` v1.0.11, whose
+`WebackVacuumRobot(StateVacuumEntity)` still declares both properties, and
+report nothing on the other eleven.
+
+Scoping is deliberately narrow. It only applies to classes integrations are
+meant to subclass, which Home Assistant names `<Domain>Entity`. `ConfigFlow`,
+`DeviceRegistry` and `TemperatureConverter` all carry markers of their own and
+nobody overrides them, so a scoped rule there would be a matcher that can never
+match.
+
+### A call pinned to its module does not need the length gate either
+
+The eighteen-character gate predates module pinning. Since the dolphin false
+positive in 1.0.0 every auto-derived `call` matcher carries the core module
+that defines the function, and the engine refuses a bare call that was not
+imported from that exact module, so a rule for `is_closed` pinned to
+`homeassistant.components.cover` cannot fire on anybody's own `is_closed`.
+The import graph already proves what the gate was guessing at. `import_from`
+rules have skipped the gate on that argument since 1.6.0; call matchers now do
+too, and only the denylist still applies to them. The gate is left with the
+one case that has no proof, a deprecated class name, which is `InfraredEntity`
+on today's dev.
+
+That turns four announced removals from prose into matchers:
+`cover.is_closed` (2027.10), `modbus.get_hub` (2027.10),
+`labs.helpers.async_listen` (2027.3) and
+`TemperatureConverter.convert_interval` (2026.12). On the re-crawl one of them
+found something at once: `wills106/homeassistant-solax-modbus` 2026.08.2 does
+`from homeassistant.components.modbus import get_hub` and calls it at
+`modbus_transport.py:31`, which puts 2027.10 on the board for the first time. A deprecated method is
+pinned to its class as well as its module, which is what lets
+`TemperatureConverter.convert_interval(...)` resolve; the same pin now applies
+to `FlowHandler.show_advanced_options`, which had never matched anything.
+
+Merging then had to learn one thing. The extracted `core-call-async-get-device`
+matches the same calls as the hand-written `device-registry-async-get-device`,
+and both firing would report every line twice. A core rule whose matcher
+covers the same calls as a manual one is dropped at merge time, and the crawl
+log says which.
+
+### `in_class_base` resolves an aliased base (engine 8)
+
+`from homeassistant.components.vacuum import StateVacuumEntity as Base` made
+the class invisible to a scoped rule: the base list said `Base` and the matcher
+was looking for `StateVacuumEntity`. Base names are now resolved through the
+file's import map first, which also covers `classbase` rules. A relative import
+is deliberately not resolved, on the same reasoning that already keeps
+`from .my_registry import async_get_device` out of the device registry rule.
+
+That gap was real, and the re-crawl proves it. `al-one/hass-xiaomi-miot` v1.1.4
+declares `class XiaoxunWatchTrackerEntity(MiotTrackerEntity)` and, four lines
+of file above, `class MiotTrackerEntity(MiotEntity, BaseTrackerEntity)`. The
+subclass sets `_attr_location_name` at `device_tracker.py:228`, which no
+version before this one reported: `XiaoxunWatchTrackerEntity` names no base the
+rule knows, and its own base is in the same file. Same tag, same rule, one more
+finding.
+
+A scoped rule now also follows one level of local subclassing, so
+
+    class BaseVacuum(StateVacuumEntity): ...
+    class MyVacuum(BaseVacuum):
+        @property
+        def battery_level(self): ...
+
+is a finding. A chain that leaves the file is not followed: nothing in the file
+proves what `from .base import BaseVacuum` derives from, and undercounting is
+the side to be wrong on.
+
+`ENGINE_VERSION` is 8, which queues every repository for a rescan.
+
+### What the re-crawl measured
+
+`ENGINE_VERSION` 8 and the wider rule set each requeue every catalogue
+repository, and all 4 009 were rescanned locally for this release. The daily
+crawl happened to run the previous rule set over the same 4 009 repositories
+the same morning, which makes the comparison unusually clean: same catalogue,
+same tags, same day, different rules.
+
+| Release | Before | After |
+|---|---|---|
+| 2026.10 | 11 | 11 |
+| 2026.11 | 96 | 96 |
+| 2027.5 | 11 | 11 |
+| 2027.6 | 51 | 51 |
+| 2027.7 | 29 | 29 |
+| 2027.8 | 742 | 742 |
+| 2027.10 | 0 | 1 |
+
+880 affected repositories both times; 2 272 findings from 2 270. The two new
+findings are exactly the two described above, `hass-xiaomi-miot` at
+`device_tracker.py:228` and `solax-modbus` at `modbus_transport.py:31`, and
+nothing that was found before is lost. Matchable rules go from 54 to 58;
+published rules from 118 to 117, because one core rule now yields to the
+hand-written twin that already covered it.
+
+### The board says how much the gate costs
+
+Every marker the length gate or the denylist drops is now counted during
+extraction and published as `counts.markers_discarded` in `rules.json`, with
+the symbol, the reason and the core line in `discarded_markers`. The board and
+the README carry the total, minus any symbol a hand-written rule already covers,
+so "removals with no detector" is no longer the only visible gap.
+`tools/check_local.py` states the same thing about the rule set it ran, so an
+author reading "OK" knows how much was looked for.
+
+### The integration searches for the name someone would paste
+
+A repair's "see whether it is already reported" link searched the repository
+for the rule's whole symbol, and `StateVacuumEntity.battery_level` or
+`async_import_statistics(missing unit_class)` finds nothing anyone wrote in an
+issue title. The crawler already reduced a symbol to its bare name for its own
+lookup; that helper lives in the shared engine now and the integration uses it
+too.
+
 ## 1.10.0 — 2026-08-28
 
 ### Rules for the release in RC no longer retire a week early (#46)
