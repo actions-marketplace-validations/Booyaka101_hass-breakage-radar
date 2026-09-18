@@ -89,6 +89,73 @@ def test_the_crawl_commits_every_published_artifact(repo_root):
     assert "state/feed.json" in staged
 
 
+def test_the_crawl_rebases_onto_main_keeping_its_own_side(repo_root):
+    """Rebase swaps the names: ours is origin/main, the branch being replayed
+    onto, and theirs is the crawl's own commit. `-X ours` on a generated file
+    therefore throws away the refresh the run just spent ten minutes on."""
+    sources = [
+        (repo_root / ".github" / "workflows" / "crawl.yml").read_text(encoding="utf-8"),
+        (repo_root / "tools" / "push_crawl.sh").read_text(encoding="utf-8"),
+    ]
+    onto = [
+        line
+        for source in sources
+        for line in re.findall(r"^.*git rebase.*origin/main.*$", source, re.M)
+    ]
+    assert onto, "the crawl no longer rebases onto main"
+    for line in onto:
+        assert "-X theirs" in line, line
+
+
+def test_every_crawl_commit_goes_through_the_same_push(repo_root):
+    """Both steps race the same moving main, and the one that gave up after a
+    single rejected push was the one saving work nothing else had kept."""
+    workflow = (repo_root / ".github" / "workflows" / "crawl.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "git commit" not in workflow, "a step commits without the shared push"
+    assert "bash tools/push_crawl.sh" in workflow
+    script = (repo_root / "tools" / "push_crawl.sh").read_text(encoding="utf-8")
+    assert "for attempt in 1 2 3" in script, "the shared push stopped retrying"
+
+
+def test_a_rule_that_landed_mid_crawl_survives_the_rebase(repo_root):
+    """Taking the crawl's side is right for the files it generates from the
+    catalogue. data/rules.json is generated from manual_rules.json and the
+    blog, so a rule merged while the run was going is only in main's copy."""
+    script = (repo_root / "tools" / "push_crawl.sh").read_text(encoding="utf-8")
+    assert "git checkout origin/main -- data/rules.json" in script
+    assert script.index("git checkout origin/main -- data/rules.json") < script.index(
+        "git rebase -X theirs origin/main"
+    )
+    assert "--amend" in script
+
+
+def test_a_crawl_that_does_not_finish_still_commits_its_progress(repo_root):
+    """The scan saves its state every 25 repositories, which buys nothing if
+    every step that commits is skipped when the job is cancelled or times out.
+    Not when the suite rejected the fresh data, though, and not the index:
+    that is rebuilt after the scan and published by a run that got that far."""
+    workflow = (repo_root / ".github" / "workflows" / "crawl.yml").read_text(
+        encoding="utf-8"
+    )
+    step = workflow[workflow.index("Save the crawl progress") :]
+    assert "always()" in step
+    assert "steps.verify.outcome != 'failure'" in step
+    assert re.search(r"^\s*id: verify$", workflow, re.M), "no step to check against"
+    staged = re.search(r"^\s*git add (.*)$", step, re.M)
+    assert staged
+    assert set(staged.group(1).split()) == {
+        "data/catalog.json",
+        "data/findings.json",
+        "state/crawl.json",
+    }
+    # The index carries over from the step that publishes, so the step has to
+    # clear it or a commit that died after staging docs/ gets published here.
+    reset = re.search(r"^\s*git reset\s*$", step, re.M)
+    assert reset and reset.start() < staged.start()
+
+
 def test_the_author_guide_is_reachable_from_the_readme(repo_root):
     guide = repo_root / "guides" / "for-integration-authors.md"
     assert guide.exists()
@@ -226,6 +293,26 @@ def test_sensor_state_and_attributes(sample_index):
     assert sensor.extra_state_attributes["findings"][0]["line"] == 12
     assert sensor.extra_state_attributes["index_generated_utc"] == "2026-08-08T09:00:00Z"
     assert "last_error" not in sensor.extra_state_attributes
+
+
+def test_the_sensor_carries_the_release_a_finding_starts_warning_in(sample_index):
+    """The removal is a year out and the warning is next month, so the warning
+    is the date an automation has any reason to fire on. It survives the trim
+    the 16 KB attribute limit forces; every other finding carries an empty
+    string, which is a handful of bytes and keeps the list templatable."""
+    sample_index["rules"][0]["reports_in"] = "2026.10"
+    report = build_report(sample_index, {"fixture_tracker": "0.1.0"})
+    sensor = BreakageRadarSensor(FakeCoordinator(report))
+
+    (finding,) = sensor.extra_state_attributes["findings"]
+    assert finding["breaks_in"] == "2027.5"
+    assert finding["reports_in"] == "2026.10"
+
+
+def test_a_finding_with_one_date_reports_an_empty_warning_release(sample_index):
+    report = build_report(sample_index, {"fixture_tracker": "0.1.0"})
+    sensor = BreakageRadarSensor(FakeCoordinator(report))
+    assert sensor.extra_state_attributes["findings"][0]["reports_in"] == ""
 
 
 def test_sensor_is_unavailable_and_keeps_the_last_report_on_failure(sample_index):

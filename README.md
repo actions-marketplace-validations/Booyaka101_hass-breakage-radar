@@ -48,16 +48,17 @@ or into Home Assistant's own `feedreader` integration; open it in a browser and 
 renders as a page.
 
 **In the published index right now:** all 4 009 HACS repositories crawled
-(3 244 integrations and 765 Lovelace plugins, 19 unreachable), **922 affected**,
-**2 504 findings**, across 8 Home Assistant releases: 11 in 2026.10, 96 in 2026.11,
-11 in 2027.5, 51 in 2027.6, 28 in 2027.7, 735 in 2027.8, 142 in 2027.9 and 1 in 2027.10
-(counted by distinct integration domain). 63 of the 123 announced removals have a
-matcher behind them; the board says so on itself, and the other 60 are carried for
-their deadline only. Three markers are refused as too vague to match, which the board
-also states: `InfraredEntity`, a class name too short to match on its own, and the two
-English words the extractor used to mistake for keyword names; a short name pinned to
-its module or scoped to its entity base class is matched anyway. Every number comes
-from a real crawl; nothing is seeded or simulated.
+(3 243 integrations and 766 Lovelace plugins, 27 unreachable), **826 affected**,
+**2 158 findings**, across 8 Home Assistant releases: 10 in 2026.10, 16 in 2026.11,
+11 in 2027.5, 45 in 2027.6, 26 in 2027.7, 588 in 2027.8, 134 in 2027.9 and 216 in 2027.10
+(counted by distinct integration domain). 64 of the 124 announced removals have a
+matcher behind them; the board says so on itself, and lists the other 60 by release
+under "Announced removals with no detector", for the deadline alone. Three markers
+are refused as too vague to match, which the board also states: `InfraredEntity`, a
+class name too short to match on its own, and the two English words the extractor
+used to mistake for keyword names; a short name pinned to its module or scoped to
+its entity base class is matched anyway. Every number comes from a real crawl;
+nothing is seeded or simulated.
 The daily job keeps these moving, and `coverage` in `index.json` is always authoritative.
 
 <p align="center">
@@ -525,14 +526,33 @@ prose with no `report_usage` call behind them — the legacy device tracker plat
 the device registry single-config-entry changes, the device tracker property removals.
 Each one quotes its source post.
 
-Core sometimes carries a marker for the same removal whose message is prose the
-extractor cannot turn into a matcher. A hand-written rule can name those ids in
-`supersedes`, and the merge drops them: two board entries for one deprecation, one of
-them with no matcher and no advice, reads as two problems.
+A rule can also carry `reports_in`, the release the API starts logging a warning in when
+that is earlier than the release it is removed in. `DeviceEntry.config_entries` warns
+from 2026.10 and is removed in 2027.10, and a board showing only one of those either
+hides the logs filling up next month or moves a two-year deadline forward by two years.
+It is a second date on the same rule, never a second deadline: ordering, bucketing and
+retirement all key off `breaks_in`. A rule whose two releases are the same carries no
+`reports_in` at all, and renders exactly as every other rule does.
+
+A rule can also carry `search`, which replaces the term its repositories are searched
+for upstream. The term is otherwise the last dotted part of the symbol, so
+`DeviceRegistry.devices` becomes `devices`. Asking GitHub for both terms across all 125
+repositories the rule affects, the bare term finds a report in 53 of them and
+`device_registry.devices` in 16, and only 13 of those are the same issue. The other 40
+are about something else: "no devices in home tab", "Devices duplicated after upgrade".
+`device-registry-devices-mapping` asks for the dotted term instead.
+
+Core, and the blog itself, sometimes carry a marker for the same removal whose message
+is prose the extractor cannot turn into a matcher. A hand-written rule can name those
+ids in `supersedes`, and the merge drops them: two board entries for one deprecation,
+one of them with no matcher and no advice, reads as two problems.
 
 **3. Blog prose (`origin: blog`).** Every removal sentence found on
 <https://developers.home-assistant.io/blog/>, published as `matchable: false` so the
-board shows the deadline even when no static check exists.
+board shows the deadline even when no static check exists. A post that only dates the
+end of a support window counts as one too, unless the removal written beside it lands
+a release later, which makes the window an early warning about that removal rather
+than a deadline of its own.
 
 ### Why matching resolves imports
 
@@ -749,6 +769,22 @@ relevant existing report if there is one. That is what lets a notification say
 "already reported, add a reaction there" instead of sending everybody to open
 the same issue. It is optional, so an older index simply lacks it.
 
+A search hit only becomes that report if its **title** says so, by naming the
+deprecated symbol, by using a word like "deprecated" or "removed", or by naming a
+release core has not shipped yet. A symbol pasted into the body of an unrelated bug
+report is not evidence, and neither is "Not working on 2021.12" filed against a 2027
+removal.
+
+The fact records `checked_utc`, and a crawl re-asks every affected repository whose
+fact is more than a week old, up to a few hundred a run. Facts found under a term
+their rule no longer asks for go first, then the oldest. A repository
+that never cuts another release is never rescanned, so without that its issue link
+would stay published for good, however wrong it had gone. When the search does not
+come back with the report already on file, that issue is fetched by number: an issue
+drops out of a ten-hit search on its own, but a 404 means it is really gone. What
+survives a 404 is only what says not to file there, that the repository was archived
+or had issues turned off. The report link goes with the tracker it pointed into.
+
 Every `matchable: true` rule ships its matcher as the nested `match` object — that is
 what lets the integration run the same rules over locally installed code without the
 index changing shape for it.
@@ -766,7 +802,7 @@ For the crawler:
 
 | Setting | Where | Default |
 |---|---|---|
-| Repos per run | `tools/scan.py --limit N` | `400` |
+| Repos per run | `tools/scan.py --limit N` | `400` (upstream lookups cap at 400) |
 | Rescan everything | `tools/scan.py --force` | off |
 | One repository | `tools/scan.py --only owner/repo` | — |
 | Politeness pause | `tools/scan.py --sleep 0.25` | `0` |
@@ -858,6 +894,11 @@ real package is used instead.
   `hass.config_entries` among them. A missed
   call is a rule that stays quiet; a wrong one would waste a maintainer's afternoon,
   so the matcher is built to under-report.
+  A receiver proved to be a `DeletedDeviceEntry` or a `ChildDeviceEntry` counts the
+  same way, because both carry the properties. Nothing in the catalogue matches that
+  way yet: every integration that has touched the 2026.9 classes reaches them through
+  `getattr(dr, "ChildDeviceEntry", ())` so it still runs on 2026.8, and a name fetched
+  at runtime is not a type any AST can prove.
 * **A scoped `attr` rule resolves base classes one level, inside one file.** A class
   deriving from `StateVacuumEntity` is matched whether it names the base directly, under
   an import alias, dotted as `vacuum.StateVacuumEntity`, among several bases, or through

@@ -13,7 +13,14 @@ import pytest
 from tools import scan as scan_module
 from tools.common import NotFound, RateLimited
 from tools.rules_engine import Rule, matchable_rules
-from tools.scan import main, rules_hash, scan_repo, select_slice
+from tools.scan import (
+    main,
+    rules_hash,
+    scan_repo,
+    select_slice,
+    upstream_still_applies,
+)
+from tools.upstream import FACT_MAX_AGE_DAYS, LOOKUP_LIMIT
 
 RULE = Rule(
     id="legacy-device-tracker-platform",
@@ -390,11 +397,11 @@ SAME_FINDING = [
 ]
 
 
-def _rescan_one(tmp_path, monkeypatch, findings: list[dict]) -> dict:
-    """Force a rescan of a/one that reproduces ``findings``, and return it."""
+def _rescan_one(tmp_path, monkeypatch, findings: list[dict], upstream=None) -> dict:
+    """Force a rescan of a/one over a record holding ``findings``, and return it."""
     rules_path, catalog_path = _write_inputs(tmp_path, catalog=CATALOG[:1])
     (tmp_path / "findings.json").write_text(
-        _findings_doc(UPSTREAM, findings), encoding="utf-8"
+        _findings_doc(upstream or UPSTREAM, findings), encoding="utf-8"
     )
     monkeypatch.setattr(
         scan_module,
@@ -414,11 +421,209 @@ def test_an_unchanged_rescan_keeps_the_upstream_report(tmp_path, monkeypatch):
     assert _rescan_one(tmp_path, monkeypatch, SAME_FINDING)["upstream"] == UPSTREAM
 
 
-def test_a_rescan_that_finds_something_else_drops_the_upstream_report(
+def test_a_rescan_that_no_longer_trips_the_symbol_drops_the_upstream_report(
     tmp_path, monkeypatch
 ):
-    changed = [{**SAME_FINDING[0], "rule_id": "some-other-rule", "line": 99}]
-    assert "upstream" not in _rescan_one(tmp_path, monkeypatch, changed)
+    """Carrying it forward would keep linking people to an issue about an API
+    the repository has already migrated off."""
+    other = {**UPSTREAM, "symbol": "async_import_statistics"}
+    assert "upstream" not in _rescan_one(
+        tmp_path, monkeypatch, SAME_FINDING, upstream=other
+    )
+
+
+def test_the_pending_floor_reaches_the_upstream_lookup(tmp_path, monkeypatch):
+    """Without a release to compare against, every issue title naming one
+    counts, including the 2021.12 and 2022.11 ones that were published as
+    reports. It is the floor and not dev: during the RC window a title about
+    the release being cut is about something nobody is running yet."""
+    rules_path, catalog_path = _write_inputs(
+        tmp_path,
+        catalog=CATALOG[:1],
+        core_version="2026.10",
+        latest_release="2026.8",
+        pending_floor="2026.9",
+        pending_floor_source="pypi",
+    )
+    monkeypatch.setattr(
+        scan_module,
+        "http_get",
+        lambda url, **kwargs: _tarball_bytes(
+            {"custom_components/one/device_tracker.py": TRACKER_SOURCE}
+        ),
+    )
+    seen: dict[str, object] = {}
+
+    def fake_annotate(records, rules_by_id, **kwargs):
+        seen.update(kwargs)
+        seen["rules"] = rules_by_id
+        return 0
+
+    monkeypatch.setattr(scan_module, "annotate", fake_annotate)
+    assert main(_argv(tmp_path, rules_path, catalog_path)) == 0
+    assert seen["current_version"] == "2026.9"
+    assert seen["rules"][RULE.id] == {"symbol": "setup_scanner", "search": None}
+
+
+def _found_nothing(entry, rules, fetched=None):
+    """A scan of a repository with nothing wrong in it."""
+    return (
+        {
+            "domain": entry["domain"],
+            "version": entry["last_version"],
+            "ref": "refs/tags/1.0.0",
+            "status": "scanned",
+            "scanned_utc": "2026-08-08T00:00:00Z",
+            "files_scanned": 1,
+            "syntax_errors": 0,
+            "findings": [],
+        },
+        [],
+    )
+
+
+def test_a_repository_outside_the_slice_is_still_offered_for_a_lookup(
+    tmp_path, monkeypatch
+):
+    """A repository that cuts no release is never in a slice again, so a
+    lookup over the slice alone left its recorded issue published for good,
+    however wrong the fact had gone."""
+    rules_path, catalog_path = _write_inputs(tmp_path)
+    (tmp_path / "findings.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "repos": {
+                    name: {
+                        "domain": name.split("/")[1],
+                        "status": "scanned",
+                        "findings": [
+                            {
+                                "rule_id": RULE.id,
+                                "breaks_in": "2027.5",
+                                "file": f"custom_components/{name.split('/')[1]}/device_tracker.py",
+                                "line": 7,
+                                "confidence": "high",
+                            }
+                        ],
+                    }
+                    # z/delisted is published while it has findings, catalogue
+                    # or no catalogue, so its fact has to age like the rest.
+                    for name in ("b/two", "z/delisted")
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    offered: list[str] = []
+
+    def fake_annotate(records, rules_by_id, **kwargs):
+        offered.extend(sorted(records))
+        return 0
+
+    monkeypatch.setattr(scan_module, "scan_repo", _found_nothing)
+    monkeypatch.setattr(scan_module, "annotate", fake_annotate)
+    assert main(_argv(tmp_path, rules_path, catalog_path, "--limit", "1")) == 0
+    assert offered == ["a/one", "b/two", "z/delisted"]
+
+
+def test_one_limit_covers_the_scan_and_the_lookups(tmp_path, monkeypatch):
+    """--limit is how much work a run does. Left to its own default, a
+    --limit 5 smoke test scanned five repositories and then spent a quarter of
+    an hour on four hundred lookups. It buys lookups up to the cap only: a
+    full rescan asks for thousands of repositories, and thousands of lookups
+    at 2.1 seconds apart outlast the job they run in."""
+    rules_path, catalog_path = _write_inputs(tmp_path)
+    budget: list[int] = []
+    monkeypatch.setattr(scan_module, "scan_repo", _found_nothing)
+    monkeypatch.setattr(
+        scan_module,
+        "annotate",
+        lambda records, rules, **kwargs: budget.append(kwargs["limit"]),
+    )
+    assert main(_argv(tmp_path, rules_path, catalog_path, "--limit", "1")) == 0
+    assert budget == [1]
+    assert main(_argv(tmp_path, rules_path, catalog_path, "--limit", "4000")) == 0
+    assert budget == [1, LOOKUP_LIMIT]
+
+
+def test_naming_a_repository_asks_about_it_however_young_its_fact_is(
+    tmp_path, monkeypatch
+):
+    """A forced rescan carries the fact forward with its old timestamp, so the
+    freshness gate answered nothing at all to `--only owner/repo`, which is the
+    one command whose whole point is that repository."""
+    rules_path, catalog_path = _write_inputs(tmp_path)
+    ages: list[int] = []
+    monkeypatch.setattr(scan_module, "scan_repo", _found_nothing)
+    monkeypatch.setattr(
+        scan_module,
+        "annotate",
+        lambda records, rules, **kwargs: ages.append(kwargs["max_age_days"]),
+    )
+    assert main(_argv(tmp_path, rules_path, catalog_path)) == 0
+    assert main(_argv(tmp_path, rules_path, catalog_path, "--only", "a/one")) == 0
+    assert ages == [FACT_MAX_AGE_DAYS, 0]
+
+
+def test_a_crawl_killed_during_the_lookups_keeps_the_ones_it_made(
+    tmp_path, monkeypatch
+):
+    """The runner's timeout covers the lookups too, and they are the slowest
+    part of a quiet day: 2.1 seconds apart, up to four hundred of them."""
+    rules_path, catalog_path = _write_inputs(tmp_path)
+
+    def annotate(records, rules, *, checkpoint, **kwargs):
+        records["a/one"]["upstream"] = {"symbol": "setup_scanner", "archived": True}
+        checkpoint()
+        raise TimeoutError("runner cancelled the job")
+
+    monkeypatch.setattr(scan_module, "scan_repo", _found_nothing)
+    monkeypatch.setattr(scan_module, "annotate", annotate)
+    with pytest.raises(TimeoutError):
+        main(_argv(tmp_path, rules_path, catalog_path))
+    saved = json.loads((tmp_path / "findings.json").read_text(encoding="utf-8"))
+    assert saved["repos"]["a/one"]["upstream"]["archived"] is True
+
+
+def test_a_day_with_nothing_to_scan_still_refreshes_the_facts(tmp_path, monkeypatch):
+    """Most days the slice is empty: 4 009 of the 4 021 state entries are
+    already current. Returning early there is a week with no refresh at all."""
+    rules_path, catalog_path = _write_inputs(tmp_path)
+    monkeypatch.setattr(scan_module, "scan_repo", _found_nothing)
+    runs: list[int] = []
+    monkeypatch.setattr(
+        scan_module, "annotate", lambda records, rules, **kw: runs.append(len(records))
+    )
+    argv = _argv(tmp_path, rules_path, catalog_path)
+    assert main(argv) == 0
+    assert main(argv) == 0, "the second run has nothing left to scan"
+    assert len(runs) == 2
+
+
+def test_a_fact_dropped_on_a_quiet_day_is_dropped_on_disk(tmp_path, monkeypatch):
+    """A repository whose findings are all gone loses its upstream fact, and
+    that happens whether or not the run had a lookup to spend. Most days it has
+    none, and the stale fact was written back untouched."""
+    rules_path, catalog_path = _write_inputs(tmp_path)
+    monkeypatch.setattr(scan_module, "scan_repo", _found_nothing)
+
+    def records_the_fact(records, rules, **kwargs):
+        records["a/one"]["upstream"] = {"symbol": "setup_scanner", "archived": True}
+        return 1
+
+    def drops_the_fact(records, rules, **kwargs):
+        records["a/one"].pop("upstream", None)
+        return 0
+
+    argv = _argv(tmp_path, rules_path, catalog_path)
+    monkeypatch.setattr(scan_module, "annotate", records_the_fact)
+    assert main(argv) == 0
+    monkeypatch.setattr(scan_module, "annotate", drops_the_fact)
+    assert main(argv) == 0
+    saved = json.loads((tmp_path / "findings.json").read_text(encoding="utf-8"))
+    assert "upstream" not in saved["repos"]["a/one"]
 
 
 def test_an_older_interpreter_than_the_extractor_is_warned_about(monkeypatch, caplog):
@@ -436,3 +641,49 @@ def test_an_older_interpreter_than_the_extractor_is_warned_about(monkeypatch, ca
     assert warn_if_older_python("3.11") is False
     assert warn_if_older_python(None) is False
     assert warn_if_older_python("garbage") is False
+
+
+def test_a_rule_renamed_for_the_same_symbol_keeps_the_upstream_report(
+    tmp_path, monkeypatch
+):
+    """A hand-written rule superseding core's own changes the rule id but not
+    the API. The issue the repo already filed is about the API."""
+    renamed = [{**SAME_FINDING[0], "rule_id": "core-moduledef-setup-scanner"}]
+    assert _rescan_one(tmp_path, monkeypatch, renamed)["upstream"] == UPSTREAM
+
+
+def test_a_rule_breaking_sooner_does_not_discard_the_fact():
+    """The fact is about a symbol the repository uses, not about which of its
+    deprecations happens to break first."""
+    symbols = {"soon": {"symbol": "other"}, "later": {"symbol": "setup_scanner"}}
+    findings = [
+        {"rule_id": "soon", "breaks_in": "2027.8"},
+        {"rule_id": "later", "breaks_in": "2027.10"},
+    ]
+    assert upstream_still_applies(UPSTREAM, findings, symbols) is True
+
+
+def test_a_repository_that_fixed_the_symbol_loses_the_fact():
+    symbols = {"soon": {"symbol": "other"}}
+    findings = [{"rule_id": "soon", "breaks_in": "2027.8"}]
+    assert upstream_still_applies(UPSTREAM, findings, symbols) is False
+
+
+def test_no_findings_leaves_nothing_for_an_upstream_fact_to_be_about():
+    assert upstream_still_applies(UPSTREAM, [], {}) is False
+
+
+def test_a_fact_is_kept_against_the_term_the_rule_asked_for():
+    """The fact is filed under what the repository was searched for. When a
+    rule overrides that term, a fact filed under the old one is stale and gets
+    looked up again."""
+    rules = {
+        "mapping": {
+            "symbol": "DeviceRegistry.devices",
+            "search": "device_registry.devices",
+        }
+    }
+    findings = [{"rule_id": "mapping", "breaks_in": "2027.9"}]
+    overridden = {**UPSTREAM, "symbol": "device_registry.devices"}
+    assert upstream_still_applies(overridden, findings, rules) is True
+    assert upstream_still_applies({**UPSTREAM, "symbol": "devices"}, findings, rules) is False

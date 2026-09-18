@@ -42,8 +42,18 @@ from tools.common import (  # noqa: E402
 from tools.feed import build as build_feed  # noqa: E402
 from tools.feed import update_first_seen
 from tools.release import floor_from_payload  # noqa: E402
-from tools.rules_engine import is_pending, parse_version  # noqa: E402
-from tools.schedule import days_until, long_date, release_estimated_date  # noqa: E402
+from tools.rules_engine import (  # noqa: E402
+    clip,
+    is_pending,
+    parse_version,
+    reports_before_removal,
+)
+from tools.schedule import (  # noqa: E402
+    days_until,
+    describe_report,
+    long_date,
+    release_estimated_date,
+)
 
 SCHEMA_VERSION = 1
 INDEX_URL = "https://booyaka101.github.io/hass-breakage-radar/index.json"
@@ -259,8 +269,11 @@ def build_payload(
             "repos_scanned": len(set(repos) & set(catalog_by_name)),
             "repos_delisted": len(set(repos) - set(catalog_by_name)),
             "repos_affected": len(integrations),
-            "repos_clean": len(clean_domains),
-            "repos_unreachable": len(unreachable),
+            # Counted off by_category, not off clean_domains and unreachable:
+            # those two are keyed by domain and a Lovelace card has none, so
+            # taking their length silently dropped every card.
+            "repos_clean": sum(c["clean"] for c in by_category.values()),
+            "repos_unreachable": sum(c["unreachable"] for c in by_category.values()),
             "findings_total": sum(len(i["findings"]) for i in integrations),
             "rules_published": len(published_rules),
             "rules_matchable": sum(1 for r in published_rules if r.get("matchable")),
@@ -355,6 +368,7 @@ section.release > h2 {{ font-size:19px; margin:0 0 4px;
   font-size:13px; }}
 .rulelist li {{ margin:3px 0; }}
 .rulelist code {{ color:var(--ink); }}
+.reports {{ display:block; color:var(--warn); }}
 table {{ width:100%; border-collapse:collapse; background:var(--panel);
   border:1px solid var(--line); border-radius:10px; overflow:hidden; }}
 th, td {{ text-align:left; padding:9px 12px; border-bottom:1px solid var(--line);
@@ -441,7 +455,7 @@ const RANK = {{high: 3, medium: 2, low: 1, info: 0}};
 function apply() {{
   const needle = q.value.trim().toLowerCase();
   const floor = conf.value ? RANK[conf.value] : 0;
-  document.querySelectorAll('section.release').forEach(section => {{
+  document.querySelectorAll('section.release:not(.deadline)').forEach(section => {{
     let shown = 0;
     section.querySelectorAll('tbody tr').forEach(row => {{
       const okText = !needle || row.dataset.search.includes(needle);
@@ -454,6 +468,21 @@ function apply() {{
     section.hidden = shown === 0;
     const counter = section.querySelector('.pill');
     if (counter) counter.textContent = shown + ' repositor' + (shown === 1 ? 'y' : 'ies');
+  }});
+  // Nothing under these matched a repository, and both dropdowns are about
+  // matches, so either one narrows the board past what this bucket can answer.
+  const deadlines = !cat.value && !conf.value;
+  document.querySelectorAll('section.deadline').forEach(section => {{
+    let shown = 0;
+    section.querySelectorAll('li').forEach(item => {{
+      const visible = deadlines &&
+        (!needle || item.dataset.search.includes(needle));
+      item.hidden = !visible;
+      if (visible) shown++;
+    }});
+    section.hidden = shown === 0;
+    const counter = section.querySelector('.pill');
+    if (counter) counter.textContent = shown + ' removal' + (shown === 1 ? '' : 's');
   }});
   document.querySelectorAll('.bucket').forEach(bucket => {{
     const sections = bucket.querySelectorAll('section.release');
@@ -570,6 +599,37 @@ def _relative(days: int) -> str:
     return f"{-days} days ago"
 
 
+def rule_item(rule_id: str, rule: dict[str, Any], today: date) -> str:
+    """One entry in a release section's rule list.
+
+    A deprecation that starts logging a warning before the release it is
+    removed in carries that release too, because a user reading "2027.10" has
+    no other way to learn their log fills up next month.
+    """
+    reports_in = rule.get("reports_in") or ""
+    note = ""
+    if reports_before_removal(reports_in, rule.get("breaks_in", "")):
+        said = describe_report(reports_in, days_until(reports_in, today))
+        note = f'<span class="reports">{html.escape(said)}</span>'
+    # A core rule cites a file and a line, which is not a link, and the
+    # GitHub blob it does carry is the one worth following.
+    source = rule.get("source_url") or rule.get("source") or ""
+    if source.startswith("http"):
+        where = f'<a href="{html.escape(source)}">source</a>'
+    else:
+        where = f"<code>{html.escape(source)}</code>"
+    message = clip(rule.get("message") or "", 200)
+    # What the box filters on, the way a repository row carries its own field:
+    # the word "source" and the markup around it are on every one of these.
+    search = f"{rule_id} {rule.get('symbol') or ''} {message}".lower()
+    return (
+        f'<li data-search="{html.escape(search)}">'
+        f"<code>{html.escape(rule_id)}</code> &mdash; "
+        f"{html.escape(message)} "
+        f"{where}{note}</li>"
+    )
+
+
 def release_heading(release: str, today: date) -> str:
     """'Home Assistant 2026.10 - 7 October 2026 - in 46 days'."""
     when = release_estimated_date(release)
@@ -578,6 +638,45 @@ def release_heading(release: str, today: date) -> str:
     return (
         f"Home Assistant {release} - {long_date(when)} - "
         f"{_relative((when - today).days)}"
+    )
+
+
+def deadline_only_section(rules: list[dict[str, Any]], today: date) -> str:
+    """The announced removals no matcher covers, listed by release.
+
+    The coverage note counts them and nothing on the page showed them, so the
+    dates they were published for were readable only in the JSON index.
+    """
+    unmatched = [rule for rule in rules if not rule.get("matchable")]
+    if not unmatched:
+        return ""
+
+    by_release: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+    for rule in unmatched:
+        by_release[rule["breaks_in"]].append(rule)
+
+    sections: list[str] = []
+    for release in sorted(by_release, key=parse_version):
+        found = sorted(by_release[release], key=lambda rule: rule["id"])
+        items = "".join(rule_item(rule["id"], rule, today) for rule in found)
+        sections.append(
+            '<section class="release deadline">'
+            f"<h2>{html.escape(release_heading(release, today))}"
+            f'<span class="pill">{len(found)} '
+            f'{"removal" if len(found) == 1 else "removals"}</span></h2>'
+            f'<ul class="rulelist">{items}</ul></section>'
+        )
+
+    return (
+        '<details class="bucket" id="no-detector"><summary>'
+        f"Announced removals with no detector ({len(unmatched)})"
+        "</summary>\n"
+        '<p class="note">No repository is ever listed under these, so they are '
+        "here for the deadline itself. Some are core's own internal migrations "
+        "that no custom integration calls, the rest are behaviour changes with "
+        "no reliable static signal to anchor a rule on.</p>\n"
+        + "\n".join(sections)
+        + "\n</details>"
     )
 
 
@@ -641,10 +740,7 @@ def render_html(payload: dict[str, Any]) -> str:
             }
         )
         rule_items = "".join(
-            f"<li><code>{html.escape(rid)}</code> &mdash; "
-            f"{html.escape((rules_by_id.get(rid, {}).get('message') or '')[:200])} "
-            f"<a href=\"{html.escape(rules_by_id.get(rid, {}).get('source', ''))}\">source</a></li>"
-            for rid in release_rules
+            rule_item(rid, rules_by_id.get(rid, {}), today) for rid in release_rules
         )
 
         rows: list[str] = []
@@ -768,6 +864,10 @@ def render_html(payload: dict[str, Any]) -> str:
             '<p class="empty">No affected integrations in the crawled slice yet. '
             "The daily crawl widens coverage automatically.</p>"
         )
+
+    deadlines = deadline_only_section(payload["rules"], today)
+    if deadlines:
+        groups.append(deadlines)
 
     return PAGE_TEMPLATE.format(
         stats=stats,
