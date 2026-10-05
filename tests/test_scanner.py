@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from conftest import scan_fixture_tree
 
+from tools.release import floor_from_payload
 from tools.rules_engine import (
     Rule,
     ScanStats,
@@ -25,14 +26,19 @@ from tools.scan import (
 
 @pytest.fixture(scope="module")
 def rules(request):
-    """The shipped rule set, restricted to what can actually be matched."""
+    """The shipped rule set, restricted to what can actually be matched.
+
+    Pending-ness is measured against the pending floor the way the crawler
+    measures it, not against ``core_version``: dev already carries the next
+    release two weeks before it ships, and a rule for the release in between
+    is the most urgent one the tool has (#46).
+    """
     path = request.config.rootpath / "data" / "rules.json"
     if not path.exists():
         pytest.skip("data/rules.json not built yet")
     payload = json.loads(path.read_text(encoding="utf-8"))
-    return matchable_rules(
-        load_rules(payload["rules"]), current_version=payload["core_version"]
-    )
+    floor, _source = floor_from_payload(payload)
+    return matchable_rules(load_rules(payload["rules"]), current_version=floor)
 
 
 def _scan_tree(root: Path, rules) -> list[dict]:
@@ -220,7 +226,37 @@ def test_repo_without_custom_components_yields_nothing(tmp_path):
     assert iter_manifest_domains(body) == []
 
 
-def test_deprecated_hass_argument_only_fires_when_hass_is_passed(rules):
+def _service_hass_rule(symbol: str) -> Rule:
+    """The matcher the extractor builds for a service helper whose leading
+    ``hass`` argument is deprecated.
+
+    Declared here rather than read from the shipped set: core deletes the
+    argument in the release it breaks in, so 2026.10 dev dropped the markers
+    from ``helpers/service.py`` and these rules left ``data/rules.json`` with
+    them. The matcher outlives the deprecation it was extracted from.
+    """
+    return Rule(
+        id=f"core-call-{symbol.replace('_', '-')}",
+        kind="call",
+        symbol=symbol,
+        message=f"passes `hass` to `{symbol}`, where the argument is ignored.",
+        breaks_in="2026.10",
+        source="homeassistant/helpers/service.py:403",
+        match={
+            "type": "call_hass_argument",
+            "names": [symbol],
+            "modules": ["homeassistant.helpers.service"],
+        },
+    )
+
+
+SERVICE_HASS_RULES = [
+    _service_hass_rule("async_extract_entity_ids"),
+    _service_hass_rule("verify_domain_control"),
+]
+
+
+def test_deprecated_hass_argument_only_fires_when_hass_is_passed():
     """The `hass` first argument is deprecated, not the function.
 
     AlexxIT/YandexStation does both on consecutive lines, which is how this
@@ -236,14 +272,14 @@ def test_deprecated_hass_argument_only_fires_when_hass_is_passed(rules):
         "    c = await service.async_extract_entity_ids(hass=hass, service_call=call)\n"
         "    return a, b, c\n"
     )
-    hits = match_source("custom_components/x/__init__.py", source, rules)
+    hits = match_source("custom_components/x/__init__.py", source, SERVICE_HASS_RULES)
     assert [(f.rule_id, f.line) for f in hits] == [
         ("core-call-async-extract-entity-ids", 6),
         ("core-call-async-extract-entity-ids", 7),
     ]
 
 
-def test_verify_domain_control_decorator_without_hass_is_clean(rules):
+def test_verify_domain_control_decorator_without_hass_is_clean():
     source = (
         "from homeassistant.helpers.service import verify_domain_control\n"
         "\n"
@@ -252,7 +288,10 @@ def test_verify_domain_control_decorator_without_hass_is_clean(rules):
         "async def handler(call):\n"
         "    return None\n"
     )
-    assert match_source("custom_components/x/services.py", source, rules) == []
+    assert (
+        match_source("custom_components/x/services.py", source, SERVICE_HASS_RULES)
+        == []
+    )
 
 
 def test_awaited_async_get_device_is_somebody_elses_method(rules):
