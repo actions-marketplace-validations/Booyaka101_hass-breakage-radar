@@ -4,6 +4,72 @@ All notable changes to Breakage Radar. Versions follow
 [semver](https://semver.org/); the `custom_components/breakage_radar/manifest.json`
 and `pyproject.toml` versions always agree (enforced by a test).
 
+## Unreleased
+
+## 1.17.3 - 2026-10-22
+
+### Test fixtures no longer count as installed integrations (#67)
+
+The crawler excludes test and fixture directories before normalising archive
+paths, for Python, integration manifests and JavaScript (including cards).
+Previously, Breakage Radar's deliberately broken test integrations were counted
+as its own code, producing a false Home Assistant 2026.11 warning. Real nested
+integration layouts remain supported. Archive-selection changes now invalidate
+cached crawl results so unchanged releases are queued for another scan.
+
+## 1.17.2 - 2026-10-19
+
+### Upstream issue titles cannot inject Markdown into Repairs notices
+
+Issue titles are escaped before being included in Repairs Markdown links, for
+both open and closed reports. A crafted upstream title can no longer insert
+an arbitrary link or formatting into the notice. Regression tests cover the
+reported link-injection payload and all escaped Markdown control characters.
+
+### A repository withdrawn at its owner's request is removed for good (#65)
+
+`Kaluzaburza/hoymiles-hit-g3-ems` (scanned earlier as
+`Kaluzaburza/Hoymiles_HIT_xxL_G3_ModBus`) was withdrawn from public
+distribution and its owner asked for it to be dropped from the catalogue, the
+published index and every cached copy. HACS's own removal was still in review,
+and its data-v2 feed kept listing the repository — so simply deleting the
+records would have had the next daily crawl re-queue it as never-scanned and
+put it back on the board as unreachable.
+
+There is now an owner-requested withdrawal list, `data/excluded.json`,
+modelled on `data/manual_rules.json`: one hand-maintained record per
+withdrawal, matched by every name the repository has carried, by its numeric
+GitHub id and by its integration domain, so a rename cannot dodge it. The
+catalogue drops the entry even while the HACS feed still lists it; the scan
+purges findings and crawl state under both names and deletes cached tag
+tarballs; and the index refuses to publish a withdrawn repository from a
+stale findings file. The board's `repos_delisted` drops by one accordingly.
+Documented under "Withdrawing a repository from the crawl" in the README,
+including the two honest limits: git history still holds the published
+indexes of the past, and a user's own installed copy is scanned on their own
+box.
+
+### The crawl stopped publishing because 2026.10 shipped
+
+`tests/test_service_hass_argument.py` guarded the five hand-written
+`call_hass_argument` matchers by asserting they ship as matchable rules.
+That assertion only holds while their removal is still ahead: Home Assistant
+2026.10 was released on 7 October 2026, the pending floor moved to 2026.11 on
+the next crawl, and the five rules retired in the release they name — by
+design, the same as every core rule. The fixture errored at setup instead,
+and the crawl gates on the suite, so every run since 8 October has failed
+before committing and the published index has stood at 30 September's
+numbers.
+
+The matchers are now exercised straight from `data/manual_rules.json`, which
+covers them whichever side of the rollover the floor is on, and a new test
+holds the lifecycle itself: all five ship while 2026.10 is ahead of the
+floor, none after it has passed. `shipped_matchable_rules` in `conftest.py`
+also measures pending-ness against the payload's floor the way `tools/scan.py`
+does, rather than against `core_version` — dev's own number, which on a day
+the floor degrades to a stale or dev-minus-one value would retire rules here
+that the crawler still ships.
+
 ## 1.17.1 — 2026-10-03
 
 ### An ignored repair stays ignored across a restart

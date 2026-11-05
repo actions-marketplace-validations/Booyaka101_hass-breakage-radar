@@ -53,9 +53,11 @@ from tools.common import (  # noqa: E402
     DATA_DIR,
     LOGGER,
     STATE_DIR,
+    Exclusion,
     NotFound,
     RateLimited,
     http_get,
+    load_excluded,
     read_json,
     setup_logging,
     utc_now_iso,
@@ -90,6 +92,28 @@ MAX_TARBALL_BYTES = 80 * 1024 * 1024
 #: Skip vendored third-party code shipped inside a custom component. Tarball
 #: paths are filtered by substring, so the shared name list becomes markers.
 VENDOR_MARKERS = tuple(f"/{name}/" for name in sorted(VENDOR_DIRECTORIES))
+
+#: Archive selection changes invalidate crawler results independently of matchers.
+SCAN_VERSION = 1
+TEST_DIRECTORIES = frozenset(
+    {"test", "tests", "testing", "fixtures", "__tests__", "__fixtures__"}
+)
+
+
+def _is_test_path(relative: str) -> bool:
+    return bool(TEST_DIRECTORIES.intersection(relative.split("/")[:-1]))
+
+
+def _component_path(relative: str) -> str | None:
+    # Check before trimming: tests/fixtures/custom_components is not installed code.
+    if _is_test_path(relative):
+        return None
+    parts = relative.split("/")
+    try:
+        index = parts.index("custom_components")
+    except ValueError:
+        return None
+    return "/".join(parts[index:])
 
 
 def candidate_refs(last_version: str) -> list[str]:
@@ -213,10 +237,9 @@ def iter_component_python(body: bytes) -> Iterator[tuple[str, bytes]]:
             _, _, relative = member.name.partition("/")
             if not relative.endswith(".py"):
                 continue
-            index = relative.find("custom_components/")
-            if index == -1:
+            path = _component_path(relative)
+            if path is None:
                 continue
-            path = relative[index:]
             if any(marker in "/" + path for marker in VENDOR_MARKERS):
                 continue
             handle = archive.extractfile(member)
@@ -242,13 +265,14 @@ def iter_javascript(
             if not member.isfile() or member.size > 4 * 1024 * 1024:
                 continue
             _, _, relative = member.name.partition("/")
+            if _is_test_path(relative):
+                continue
             if whole_repo:
                 path = relative
             else:
-                index = relative.find("custom_components/")
-                if index == -1:
+                path = _component_path(relative)
+                if path is None:
                     continue
-                path = relative[index:]
             if not path.endswith(JS_SUFFIXES) or path.endswith(".d.ts"):
                 continue
             if any(marker in "/" + path for marker in VENDOR_MARKERS):
@@ -272,8 +296,12 @@ def iter_manifest_domains(body: bytes) -> list[str]:
             if not member.isfile() or member.size > 512 * 1024:
                 continue
             _, _, relative = member.name.partition("/")
-            index = relative.find("custom_components/")
-            if index == -1 or not relative.endswith("/manifest.json"):
+            path = _component_path(relative)
+            if (
+                path is None
+                or len(path.split("/")) != 3
+                or not path.endswith("/manifest.json")
+            ):
                 continue
             handle = archive.extractfile(member)
             if handle is None:
@@ -327,10 +355,10 @@ def findings_hash(findings: list[dict[str, Any]]) -> str:
 
 
 def rules_hash(rules: list[Rule]) -> str:
-    """Identity of "what a scan would produce": rules *and* engine semantics."""
+    """Identity of a scan: rules, matcher semantics and archive selection."""
     blob = json.dumps(
         [
-            {"engine": ENGINE_VERSION},
+            {"engine": ENGINE_VERSION, "scan": SCAN_VERSION},
             *[
                 {"id": r.id, "breaks_in": r.breaks_in, "match": r.match}
                 for r in sorted(rules, key=lambda r: r.id)
@@ -446,6 +474,46 @@ def prune_retired_findings(repos: dict[str, Any], active_ids: set[str]) -> int:
     return retired
 
 
+def prune_excluded(
+    repos: dict[str, Any], state: dict[str, Any], exclusion: Exclusion
+) -> list[str]:
+    """Delete findings and crawl state for withdrawn repositories.
+
+    A repository delisted from HACS keeps its record on purpose (issue #65's
+    predecessor in spirit: the crawl's memory is the point); a repository its
+    owner withdrew is the opposite, and both of its names -- the rename leaves
+    the old one behind in both files -- have to go. Returns the names purged.
+    """
+    purged = []
+    for name in sorted(exclusion.names()):
+        if name in repos or name in state:
+            repos.pop(name, None)
+            state.pop(name, None)
+            purged.append(name)
+            LOGGER.info("purged %s from findings and crawl state at owner request", name)
+    return purged
+
+
+def purge_cached_tarballs(cache_dir: Path, names: Iterable[str]) -> int:
+    """Delete cached tag tarballs for ``names``, return how many files went.
+
+    Every cache file for a repository starts with the sanitised repository
+    name (see :func:`cache_path`), so a prefix glob reaches them all without
+    knowing the refs. The cache is disposable: the worst an over-broad glob
+    costs is a re-download.
+    """
+    purged = 0
+    for name in names:
+        # cache_path truncates the sanitised name@ref key at 120 characters,
+        # so a very long name can be cut inside the glob's own prefix. Match
+        # on what is guaranteed to survive the cut.
+        prefix = _UNSAFE_IN_FILENAME.sub("_", name)[:100]
+        for path in cache_dir.glob(f"{prefix}*"):
+            path.unlink(missing_ok=True)
+            purged += 1
+    return purged
+
+
 def select_slice(
     catalog: list[dict[str, Any]],
     state: dict[str, Any],
@@ -486,6 +554,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rules", type=Path, default=DATA_DIR / "rules.json")
     parser.add_argument("--findings", type=Path, default=DATA_DIR / "findings.json")
     parser.add_argument("--state", type=Path, default=STATE_DIR / "crawl.json")
+    parser.add_argument(
+        "--excluded",
+        type=Path,
+        default=DATA_DIR / "excluded.json",
+        help="owner-requested withdrawals, never scanned and purged when found",
+    )
     parser.add_argument(
         "--only", action="append", default=None, help="scan only these owner/repo"
     )
@@ -558,6 +632,22 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error("%s contains no integrations", args.catalog)
         return 2
 
+    # Defensive double of catalog.py's gate: a stale or hand-edited catalogue
+    # must not put a withdrawn repository back into the rotation, least of all
+    # as never-scanned, which is the front of the queue.
+    exclusion = Exclusion(load_excluded(args.excluded))
+    kept_catalog = [
+        entry
+        for entry in catalog
+        if exclusion.record_for(entry["full_name"], entry) is None
+    ]
+    if len(kept_catalog) != len(catalog):
+        LOGGER.info(
+            "skipped %d catalogue entr(y/ies) withdrawn at owner request",
+            len(catalog) - len(kept_catalog),
+        )
+        catalog = kept_catalog
+
     if args.only:
         wanted = set(args.only)
         catalog = [e for e in catalog if e["full_name"] in wanted]
@@ -591,6 +681,9 @@ def main(argv: list[str] | None = None) -> int:
     retired = prune_retired_findings(repos, {rule.id for rule in active})
     if retired:
         LOGGER.info("dropped %d finding(s) whose rule has retired", retired)
+        checkpoint()
+
+    if prune_excluded(repos, state, exclusion):
         checkpoint()
 
     pending = select_slice(
@@ -628,6 +721,14 @@ def main(argv: list[str] | None = None) -> int:
     stopped_early = False
 
     cache_dir = None if args.no_tarball_cache else (args.tarball_cache or TARBALL_CACHE_DIR)
+    if cache_dir is not None:
+        # CI keeps no cache, so this only bites on a maintainer's machine --
+        # exactly where the copies the owner asked to have deleted live.
+        purged_cache = purge_cached_tarballs(cache_dir, exclusion.names())
+        if purged_cache:
+            LOGGER.info(
+                "deleted %d cached tarball(s) for withdrawn repositories", purged_cache
+            )
     downloads = prefetch(todo, workers=args.workers, cache_dir=cache_dir)
     # Closing the generator is what cancels the queued downloads. Breaking out
     # of the loop alone would leave it referenced here and the pool running,
